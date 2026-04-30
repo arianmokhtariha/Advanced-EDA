@@ -1,6 +1,6 @@
 import psycopg2
 import pandas as pd
-from config import DB_CONFIG
+from db_config import DB_CONFIG
 
 def get_connection():
     """Returns a connection to the PostgreSQL database."""

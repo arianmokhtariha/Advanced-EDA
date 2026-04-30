@@ -2,7 +2,7 @@ import psycopg2
 from psycopg2 import sql
 import pandas as pd
 from pathlib import Path
-from config import DB_CONFIG, DB_CONFIG_INIT
+from db_config import DB_CONFIG, DB_CONFIG_INIT
 
 DATABASE_NAME = DB_CONFIG["dbname"]
 
