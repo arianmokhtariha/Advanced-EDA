@@ -4,7 +4,6 @@ import pandas as pd
 from pathlib import Path
 from db_config import DB_CONFIG, DB_CONFIG_INIT
 
-DATABASE_NAME = DB_CONFIG["dbname"]
 
 # Note: Only change SCHEMA_SQL and CSV_TABLE_MAPPING for different projects 
 
@@ -219,7 +218,7 @@ def run_setup():
     print("=" * 50)
     
     # Step 1: Create database
-    create_database(DATABASE_NAME, DB_CONFIG_INIT)
+    create_database(DB_CONFIG['dbname'], DB_CONFIG_INIT)
     
     # Step 2: Create schema
     create_schema(SCHEMA_SQL, DB_CONFIG)
