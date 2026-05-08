@@ -5,15 +5,9 @@ import numpy as np
 from typing import Optional, List
 
 
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import pandas as pd
-import numpy as np
-from typing import Optional, List
-
 def distribution_plot(
     df: pd.DataFrame,
-    title : str = 'Distribution Overview',
+    title: str = 'Distribution Overview',
     ignore_cols: Optional[List[str]] = None,
     top_n_categories: int = 10,
     n_cols: int = 2,
@@ -29,6 +23,8 @@ def distribution_plot(
     -----------
     df : pd.DataFrame
         Input dataframe to analyze
+    title : str, default='Distribution Overview'
+        Main title for the plot
     ignore_cols : List[str], optional
         Column names to exclude from visualization
     top_n_categories : int, default=10
@@ -99,7 +95,22 @@ def distribution_plot(
     n_plots = len(cols_to_plot)
     n_rows = int(np.ceil(n_plots / n_cols))
     
-    # Calculate height - increased for better spacing with rotated labels
+    # Dynamic spacing based on number of columns
+    # More columns = less spacing needed
+    if n_cols <= 2:
+        h_spacing = 0.12
+        v_spacing = 0.15
+    elif n_cols == 3:
+        h_spacing = 0.08
+        v_spacing = 0.13
+    elif n_cols == 4:
+        h_spacing = 0.05
+        v_spacing = 0.12
+    else:  # 5+ columns
+        h_spacing = 0.03
+        v_spacing = 0.10
+    
+    # Calculate height - scales with rows
     height = figsize[1] if figsize[1] is not None else n_rows * 400
     
     # Create subplots
@@ -107,8 +118,8 @@ def distribution_plot(
         rows=n_rows,
         cols=n_cols,
         subplot_titles=[col for col in cols_to_plot],
-        vertical_spacing=0.15,
-        horizontal_spacing=0.12
+        vertical_spacing=v_spacing,
+        horizontal_spacing=h_spacing
     )
     
     # Track max values for each subplot to adjust y-axis
@@ -258,6 +269,7 @@ def distribution_plot(
         )
     
     return fig
+
 
 
 
