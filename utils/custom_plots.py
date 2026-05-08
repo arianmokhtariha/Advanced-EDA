@@ -96,7 +96,6 @@ def distribution_plot(
     n_rows = int(np.ceil(n_plots / n_cols))
     
     # Dynamic spacing based on number of columns
-    # More columns = less spacing needed
     if n_cols <= 2:
         h_spacing = 0.12
         v_spacing = 0.15
@@ -125,6 +124,9 @@ def distribution_plot(
     # Track max values for each subplot to adjust y-axis
     subplot_max_values = {}
     
+    # Store stats for annotations
+    stats_annotations = []
+    
     # Plot each column
     for idx, col in enumerate(cols_to_plot):
         row = idx // n_cols + 1
@@ -147,33 +149,70 @@ def distribution_plot(
                 col=col_pos
             )
             
+            mean_val = col_data.mean()
+            median_val = col_data.median()
+            
+            # Determine the correct axis references
+            if idx == 0:
+                xref = 'x'
+                yref = 'y'
+                xref_domain = 'x domain'
+                yref_domain = 'y domain'
+            else:
+                xref = f'x{idx + 1}'
+                yref = f'y{idx + 1}'
+                xref_domain = f'x{idx + 1} domain'
+                yref_domain = f'y{idx + 1} domain'
+            
             # Add mean line
             if show_mean_line:
-                mean_val = col_data.mean()
-                fig.add_vline(
-                    x=mean_val,
-                    line_dash="dash",
-                    line_color="yellow",
-                    line_width=2,
-                    annotation_text=f"Mean: {mean_val:.2f}",
-                    annotation_position="top",
-                    row=row,
-                    col=col_pos
+                fig.add_shape(
+                    type='line',
+                    x0=mean_val,
+                    x1=mean_val,
+                    y0=0,
+                    y1=1,
+                    yref=yref_domain,
+                    xref=xref,
+                    line=dict(color='#FFD700', width=2.5, dash='dash')
                 )
             
             # Add median line
             if show_median_line:
-                median_val = col_data.median()
-                fig.add_vline(
-                    x=median_val,
-                    line_dash="dot",
-                    line_color="orange",
-                    line_width=2,
-                    annotation_text=f"Median: {median_val:.2f}",
-                    annotation_position="bottom",
-                    row=row,
-                    col=col_pos
+                fig.add_shape(
+                    type='line',
+                    x0=median_val,
+                    x1=median_val,
+                    y0=0,
+                    y1=1,
+                    yref=yref_domain,
+                    xref=xref,
+                    line=dict(color='#FF6B6B', width=2.5, dash='dot')
                 )
+            
+            # Create annotation text for this subplot
+            annotation_lines = []
+            if show_mean_line:
+                annotation_lines.append(f'<span style="color:#FFD700;">━━</span> Mean: {mean_val:.2f}')
+            if show_median_line:
+                annotation_lines.append(f'<span style="color:#FF6B6B;">⋯⋯</span> Median: {median_val:.2f}')
+            
+            if annotation_lines:
+                stats_annotations.append({
+                    'text': '<br>'.join(annotation_lines),
+                    'xref': xref_domain,
+                    'yref': yref_domain,
+                    'x': 0.98,  # Top right of subplot
+                    'y': 0.98,
+                    'xanchor': 'right',
+                    'yanchor': 'top',
+                    'showarrow': False,
+                    'font': dict(size=10, color='#fafafa'),
+                    'bgcolor': 'rgba(0,0,0,0.6)',
+                    'bordercolor': '#2d2d2d',
+                    'borderwidth': 1,
+                    'borderpad': 4
+                })
         
         else:
             # Categorical: Bar chart with percentages
@@ -223,7 +262,7 @@ def distribution_plot(
                     textfont=dict(size=10),
                     hovertext=hover_text,
                     hoverinfo='text',
-                    cliponaxis=False  # Allow text to go outside plot area
+                    cliponaxis=False
                 ),
                 row=row,
                 col=col_pos
@@ -237,12 +276,13 @@ def distribution_plot(
         title_text=title,
         title_font_size=24,
         title_x=0.5,
-        showlegend=False,
+        showlegend=False,  # Disable global legend
         plot_bgcolor='#0e1117',
         paper_bgcolor='#0e1117',
         font=dict(color='#fafafa', size=12),
         uniformtext_minsize=8,
-        uniformtext_mode='hide'
+        uniformtext_mode='hide',
+        annotations=stats_annotations  # Add all stat annotations
     )
     
     # Update axes
@@ -250,7 +290,7 @@ def distribution_plot(
         showgrid=True, 
         gridwidth=0.5, 
         gridcolor='#2d2d2d',
-        tickangle=-45,  # Rotate labels 45 degrees
+        tickangle=-45,
         tickfont=dict(size=10)
     )
     
@@ -263,12 +303,15 @@ def distribution_plot(
     # Adjust y-axis range for categorical plots to prevent text cutoff
     for (row, col_pos), max_val in subplot_max_values.items():
         fig.update_yaxes(
-            range=[0, max_val * 1.15],  # Add 15% padding at top
+            range=[0, max_val * 1.15],
             row=row,
             col=col_pos
         )
     
     return fig
+
+
+
 
 
 
