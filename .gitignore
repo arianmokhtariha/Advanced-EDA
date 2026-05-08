@@ -1,5 +1,7 @@
 .env
 
+Plans/
+
 __pycache__/
 
 *.pyc
