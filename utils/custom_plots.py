@@ -1,8 +1,11 @@
+from __future__ import annotations
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Callable
+import math
+import networkx as nx
 
 
 def distribution_plot(
@@ -506,9 +509,402 @@ def outlier_plot(
     return fig
 
 
+"""
+schema_diagram()
+────────────────
+Drop this function into utils/custom_plots.py.
+
+Usage:
+    from utils.custom_plots import schema_diagram
+    from utils.db_utils import run_query
+
+    fig = schema_diagram(run_query)
+    fig.show()
+"""
+
+# ── SQL queries for schema_diagram() (information_schema — portable across any PostgreSQL DB) ──────
+
+_FK_QUERY = """
+SELECT
+    kcu.table_name   AS child_table,
+    kcu.column_name  AS fk_column,
+    ccu.table_name   AS parent_table,
+    ccu.column_name  AS pk_column
+FROM information_schema.table_constraints       AS tc
+JOIN information_schema.key_column_usage        AS kcu
+    ON tc.constraint_name = kcu.constraint_name
+    AND tc.table_schema   = kcu.table_schema
+JOIN information_schema.constraint_column_usage AS ccu
+    ON ccu.constraint_name = tc.constraint_name
+    AND ccu.table_schema   = tc.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+  AND tc.table_schema    = '{schema}';
+"""
+
+_TABLES_QUERY = """
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = '{schema}'
+  AND table_type   = 'BASE TABLE';
+"""
 
 
+# ── Internal helpers for schema_diagram() ──────────────────────────────────────────────────────────
+
+def _get_pos(G: nx.DiGraph, layout: str, seed: int, spring_k: float) -> dict:
+    if layout == "spring":
+        return nx.spring_layout(G, seed=seed, k=spring_k)
+    elif layout == "kamada_kawai":
+        return nx.kamada_kawai_layout(G)
+    elif layout == "shell":
+        shells = sorted(G.nodes(), key=lambda n: G.in_degree(n))
+        mid = math.ceil(len(shells) / 2)
+        return nx.shell_layout(G, nlist=[shells[:mid], shells[mid:]])
+    elif layout == "circular":
+        return nx.circular_layout(G)
+    else:
+        raise ValueError(
+            f"Unknown layout '{layout}'. "
+            "Choose: spring, kamada_kawai, shell, circular"
+        )
 
 
+def _separate_nodes(pos: dict, min_dist: float = 0.28, iterations: int = 100) -> dict:
+    """
+    FIX: Iteratively push any two nodes that are closer than min_dist apart.
+    Prevents the kamada_kawai layout from stacking nodes on the same spot.
+    """
+    pos = {k: list(v) for k, v in pos.items()}
+    nodes = list(pos.keys())
+    for _ in range(iterations):
+        changed = False
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                u, v = nodes[i], nodes[j]
+                dx = pos[u][0] - pos[v][0]
+                dy = pos[u][1] - pos[v][1]
+                dist = math.sqrt(dx ** 2 + dy ** 2)
+                if dist < min_dist:
+                    push = (min_dist - dist) / 2 + 1e-6
+                    if dist > 1e-9:
+                        ux, uy = dx / dist, dy / dist
+                    else:                        # exact overlap: push horizontally
+                        ux, uy = 1.0, 0.0
+                    pos[u][0] += ux * push
+                    pos[u][1] += uy * push
+                    pos[v][0] -= ux * push
+                    pos[v][1] -= uy * push
+                    changed = True
+        if not changed:
+            break
+    return {k: tuple(v) for k, v in pos.items()}
 
 
+def _perimeter_point(
+    x0: float, y0: float,   # the OTHER node (direction reference)
+    x1: float, y1: float,   # the node whose perimeter we want
+    r: float,               # node radius in data-coord units
+) -> tuple[float, float]:
+    """
+    FIX: Return the perimeter point of node at (x1,y1) facing toward (x0,y0).
+    Used to stop edge lines and arrowheads AT the node boundary, not inside it.
+    """
+    dx, dy = x1 - x0, y1 - y0
+    dist = math.sqrt(dx ** 2 + dy ** 2)
+    if dist < 1e-9:
+        return x1, y1
+    ratio = max(0.0, (dist - r) / dist)
+    return x0 + dx * ratio, y0 + dy * ratio
+
+
+def _estimate_node_radius(
+    pos: dict, node_size: int, fig_width: int, fig_height: int
+) -> float:
+    """
+    Convert node_size (pixels, diameter) to data-coordinate units.
+    Accounts for Plotly's automatic axis padding (~30 % per side).
+    """
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    x_span = (max(xs) - min(xs)) or 1.0
+    y_span = (max(ys) - min(ys)) or 1.0
+    eff_w = (fig_width  - 40) * 0.70
+    eff_h = (fig_height - 80) * 0.70
+    r_x = (node_size / 2) / (eff_w  / x_span)
+    r_y = (node_size / 2) / (eff_h / y_span)
+    return (r_x + r_y) / 2
+
+
+# ── Main function ─────────────────────────────────────────────────────────────
+
+def schema_diagram(
+    run_query_fn: Callable[[str], pd.DataFrame],
+    *,
+    # — Data
+    schema: str = "public",
+    # — Graph layout
+    layout: Literal["spring", "kamada_kawai", "shell", "circular"] = "kamada_kawai",
+    seed: int = 42,
+    spring_k: float = 2.5,
+    # — Nodes
+    node_size: int = 28,
+    node_colorscale: str = "Blues",
+    node_border_color: str = "#6366F1",
+    node_font_size: int = 13,
+    # — Edges
+    edge_color: str = "#6366F1",
+    edge_width: float = 1.8,
+    arrow_size: float = 1.2,
+    # — Edge labels
+    edge_labels: Literal["hover", "always", "none"] = "hover",
+    edge_label_font_size: int = 8,
+    edge_label_color: str = "#94A3B8",
+    # — Figure
+    title: str = "Database Schema – Table Relationships",
+    height: int = 650,
+    width: Optional[int] = None,
+    template: str = "plotly_dark",
+    paper_bgcolor: str = "#0e1117",
+) -> go.Figure:
+    """
+    Auto-generate an interactive FK relationship diagram from a live PostgreSQL DB.
+
+    Parameters
+    ----------
+    run_query_fn : callable
+        Your existing run_query() from db_utils.  Accepts a SQL string,
+        returns a pandas DataFrame.
+    schema : str
+        Postgres schema to inspect (default: 'public').
+    layout : str
+        Node layout algorithm:
+        'kamada_kawai' (default) | 'spring' | 'shell' | 'circular'
+    seed : int
+        Random seed for the spring layout.
+    spring_k : float
+        Spring layout repulsion — increase to spread nodes further apart.
+    node_size : int
+        Marker diameter for table nodes (pixels).
+    node_colorscale : str
+        Plotly colorscale for node fill colour.
+    node_border_color : str
+        Hex colour for the node border ring.
+    node_font_size : int
+        Font size of the table-name labels.
+    edge_color : str
+        Hex colour for edges and arrowheads.
+    edge_width : float
+        Stroke width of edge lines.
+    arrow_size : float
+        Scale factor for arrowheads.
+    edge_labels : str
+        'hover'  — FK column names appear on mouse-over (default, cleaner)
+        'always' — FK column names rendered directly on the diagram
+        'none'   — no FK labels at all
+    edge_label_font_size : int
+        Font size for always-on edge labels.
+    edge_label_color : str
+        Colour for edge label text.
+    title : str
+        Figure title.
+    height : int
+        Figure height in pixels.
+    width : int or None
+        Figure width in pixels.  None = full container width.
+    template : str
+        Plotly template ('plotly_dark', 'plotly', 'ggplot2', …).
+    paper_bgcolor : str
+        Figure background colour.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+
+    # ── 1. Fetch live schema ──────────────────────────────────────────────────
+    df_fk     = run_query_fn(_FK_QUERY.format(schema=schema))
+    df_tables = run_query_fn(_TABLES_QUERY.format(schema=schema))
+
+    if df_fk is None or df_tables is None:
+        raise RuntimeError("Could not fetch schema — check your DB connection.")
+
+    # ── 2. Build graph ────────────────────────────────────────────────────────
+    G = nx.DiGraph()
+    G.add_nodes_from(df_tables["table_name"])
+
+    # Collapse parallel FK edges: one edge per (child → parent) pair,
+    # all FK→PK column pairs stored in a list on that edge.
+    edge_fks: dict[tuple, list[str]] = {}
+    for _, row in df_fk.iterrows():
+        key   = (row["child_table"], row["parent_table"])
+        label = f"{row['fk_column']} → {row['pk_column']}"
+        edge_fks.setdefault(key, []).append(label)
+
+    for (child, parent), labels in edge_fks.items():
+        G.add_edge(child, parent, fk_labels=labels)
+
+    # ── 3. Layout + FIX: separate any overlapping nodes ──────────────────────
+    pos    = _get_pos(G, layout, seed, spring_k)
+    pos    = _separate_nodes(pos)
+    _fig_w = width or 900
+    node_r = _estimate_node_radius(pos, node_size, _fig_w, height)
+
+    # ── 4. Edge lines — drawn perimeter-to-perimeter ──────────────────────────
+    edge_x, edge_y = [], []
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        sx, sy = _perimeter_point(x1, y1, x0, y0, node_r)   # source perimeter
+        tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)   # target perimeter
+        edge_x += [sx, tx, None]
+        edge_y += [sy, ty, None]
+
+    edge_trace = go.Scatter(
+        x=edge_x, y=edge_y,
+        mode="lines",
+        line=dict(width=edge_width, color=edge_color),
+        hoverinfo="none",
+    )
+
+    # ── 5. FIX: arrowhead stubs — short annotations only for the head ─────────
+    # The full line already comes from edge_trace above.
+    # Each annotation covers only the last 20 % of the edge → arrowhead sits
+    # cleanly AT the node perimeter, clearly showing which direction it points.
+    annotations = []
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        sx, sy = _perimeter_point(x1, y1, x0, y0, node_r)
+        tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)
+
+        stub_t  = 0.80          # stub tail at 80 % along the perimeter-to-perimeter segment
+        stub_ax = sx + (tx - sx) * stub_t
+        stub_ay = sy + (ty - sy) * stub_t
+
+        annotations.append(dict(
+            x=tx, y=ty,         # tip AT target perimeter
+            ax=stub_ax, ay=stub_ay,
+            xref="x", yref="y",
+            axref="x", ayref="y",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=arrow_size,
+            arrowwidth=edge_width,
+            arrowcolor=edge_color,
+            text="",
+            opacity=0.9,
+        ))
+
+    # ── 6. FIX: edge label positions ──────────────────────────────────────────
+    # Labels placed at 35 % from the source node (not midpoint).
+    # A perpendicular nudge separates labels on edges that converge on the same
+    # hub node, preventing them from stacking into an unreadable pile.
+    lbl_x, lbl_y, hover_texts, always_texts = [], [], [], []
+    for u, v, data in G.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+
+        t  = 0.35
+        lx = x0 + (x1 - x0) * t
+        ly = y0 + (y1 - y0) * t
+
+        elen = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+        if elen > 1e-9:
+            perp_x = -(y1 - y0) / elen
+            perp_y =  (x1 - x0) / elen
+            nudge  = node_r * 0.9
+            lx    += perp_x * nudge
+            ly    += perp_y * nudge
+
+        lbl_x.append(lx)
+        lbl_y.append(ly)
+
+        fk_str = "<br>".join(data["fk_labels"])
+        hover_texts.append(
+            f"<b>{u}</b> → <b>{v}</b><br>"
+            f"<span style='color:{edge_label_color}'>{fk_str}</span>"
+        )
+        always_texts.append("<br>".join(data["fk_labels"]))
+
+    if edge_labels == "hover":
+        label_trace = go.Scatter(
+            x=lbl_x, y=lbl_y,
+            mode="markers",
+            marker=dict(size=10, color="rgba(0,0,0,0)"),    # invisible hit-target
+            hovertemplate=[f"{h}<extra></extra>" for h in hover_texts],
+            hoverlabel=dict(bgcolor="#1e1e2e", font_size=11),
+        )
+    elif edge_labels == "always":
+        label_trace = go.Scatter(
+            x=lbl_x, y=lbl_y,
+            mode="text",
+            text=always_texts,
+            textfont=dict(size=edge_label_font_size, color=edge_label_color),
+            hovertemplate=[f"{h}<extra></extra>" for h in hover_texts],
+            hoverlabel=dict(bgcolor="#1e1e2e", font_size=11),
+        )
+    else:                                                    # "none"
+        label_trace = go.Scatter(
+            x=lbl_x, y=lbl_y,
+            mode="markers",
+            marker=dict(size=1, color="rgba(0,0,0,0)"),
+            hoverinfo="none",
+        )
+
+    # ── 7. Node trace ─────────────────────────────────────────────────────────
+    node_names  = list(G.nodes())
+    node_x      = [pos[n][0] for n in node_names]
+    node_y      = [pos[n][1] for n in node_names]
+    in_degrees  = [G.in_degree(n)  for n in node_names]
+    out_degrees = [G.out_degree(n) for n in node_names]
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text",
+        text=node_names,
+        textposition="top center",
+        textfont=dict(size=node_font_size, color="white"),
+        hovertemplate=[
+            f"<b>{n}</b><br>"
+            f"Referenced by {i} table(s)<br>"
+            f"References {o} table(s)"
+            f"<extra></extra>"
+            for n, i, o in zip(node_names, in_degrees, out_degrees)
+        ],
+        hoverlabel=dict(bgcolor="#1e1e2e", font_size=12),
+        marker=dict(
+            size=node_size,
+            color=in_degrees,
+            colorscale=node_colorscale,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Referenced by (n tables)", font=dict(color="white")),
+                thickness=12,
+                tickfont=dict(color="white"),
+                bgcolor="rgba(0,0,0,0)",
+                outlinewidth=0,
+            ),
+            line=dict(width=2, color=node_border_color),
+        ),
+    )
+
+    # ── 8. Assemble figure ────────────────────────────────────────────────────
+    fig = go.Figure(
+        data=[edge_trace, label_trace, node_trace],
+        layout=go.Layout(
+            title=dict(text=title, font=dict(size=18, color="white"), x=0.5),
+            template=template,
+            paper_bgcolor=paper_bgcolor,
+            plot_bgcolor=paper_bgcolor,
+            showlegend=False,
+            hovermode="closest",
+            annotations=annotations,
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            height=height,
+            width=width,
+            margin=dict(l=20, r=20, t=60, b=20),
+        ),
+    )
+
+    return fig
