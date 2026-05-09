@@ -2,7 +2,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 
 def distribution_plot(
@@ -95,22 +95,23 @@ def distribution_plot(
     n_plots = len(cols_to_plot)
     n_rows = int(np.ceil(n_plots / n_cols))
     
-    # Dynamic spacing based on number of columns
+    # Dynamic spacing — tightens as the grid grows to maximise plot area
     if n_cols <= 2:
-        h_spacing = 0.12
-        v_spacing = 0.15
+        h_spacing = 0.10
+        v_spacing = 0.12
     elif n_cols == 3:
-        h_spacing = 0.08
-        v_spacing = 0.13
+        h_spacing = 0.07
+        v_spacing = 0.11
     elif n_cols == 4:
         h_spacing = 0.05
-        v_spacing = 0.12
+        v_spacing = 0.10
     else:  # 5+ columns
         h_spacing = 0.03
-        v_spacing = 0.10
-    
-    # Calculate height - scales with rows
-    height = figsize[1] if figsize[1] is not None else n_rows * 400
+        v_spacing = 0.08
+
+    # Dynamic per-row height: progressively compact for larger grids
+    per_row_h = 380 if n_rows <= 3 else (320 if n_rows <= 6 else 270)
+    height = figsize[1] if figsize[1] is not None else n_rows * per_row_h
     
     # Create subplots
     fig = make_subplots(
@@ -270,18 +271,19 @@ def distribution_plot(
     
     # Update layout for dark mode
     fig.update_layout(
-    template='plotly_dark',
-    height=height,
-    width=figsize[0],
-    title_text=title,
-    title_font_size=24,
-    title_x=0.5,
-    showlegend=False,
-    plot_bgcolor='#0e1117',
-    paper_bgcolor='#0e1117',
-    font=dict(color='#fafafa', size=12),
-    uniformtext_minsize=8,
-    uniformtext_mode='hide',
+        template='plotly_dark',
+        height=height,
+        width=figsize[0],
+        autosize=False,
+        title_text=title,
+        title_font_size=24,
+        title_x=0.5,
+        showlegend=False,
+        plot_bgcolor='#0e1117',
+        paper_bgcolor='#0e1117',
+        font=dict(color='#fafafa', size=12),
+        uniformtext_minsize=8,
+        uniformtext_mode='hide',
     )
 
     fig.update_layout(
@@ -312,6 +314,184 @@ def distribution_plot(
         )
     
     return fig
+
+
+
+def outlier_plot(
+    df: pd.DataFrame,
+    ignore_list: Optional[List[str]] = None,
+    whis: float = 1.5,
+    orientation: Literal['horizontal', 'vertical'] = 'horizontal',
+    title: Optional[str] = "Box Plot Overview"
+) -> go.Figure:
+    """
+    Create box plots for numerical columns with outlier detection.
+    Each column gets its own subplot with an independent scale.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe.
+    ignore_list : list of str, optional
+        Columns to exclude from plotting.
+    whis : float, default 1.5
+        IQR multiplier for whisker / outlier fence calculation.
+    orientation : {'vertical', 'horizontal'}, default 'horizontal'
+        'vertical'   – subplots arranged **side-by-side** (one row);
+                       boxes are drawn vertically (value on y-axis).
+        'horizontal' – subplots **stacked** (one column per row);
+                       boxes are drawn horizontally (value on x-axis).
+    title : str, optional
+        Main figure title.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    if ignore_list is None:
+        ignore_list = []
+
+    numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    numerical_cols = [col for col in numerical_cols if col not in ignore_list]
+    if not numerical_cols:
+        raise ValueError("No numerical columns found after applying ignore_list")
+
+    n = len(numerical_cols)
+    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
+              '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52']
+
+    # ── Layout dimensions ─────────────────────────────────────────────────────
+    if orientation == 'vertical':
+        # Side-by-side subplots, one row — boxes are vertical (y = value)
+        rows, cols_n = 1, n
+        h_spacing = max(0.01, min(0.04, 0.5 / n))
+        v_spacing = 0.12
+        plot_height = 480
+    else:
+        # Stacked subplots, one column per row — boxes are horizontal (x = value)
+        rows, cols_n = n, 1
+        h_spacing = 0.04
+        v_spacing = max(0.03, min(0.12, 0.6 / n))
+        plot_height = n * 280
+
+    fig = make_subplots(
+        rows=rows, cols=cols_n,
+        subplot_titles=numerical_cols,
+        horizontal_spacing=h_spacing,
+        vertical_spacing=v_spacing,
+    )
+
+    # ── Add box traces & compute outlier stats ────────────────────────────────
+    outlier_stats = []
+    for idx, col in enumerate(numerical_cols):
+        data = df[col].dropna()
+        q1, q3 = data.quantile(0.25), data.quantile(0.75)
+        iqr = q3 - q1
+
+        # Whiskers extend to the last actual data point inside the IQR fence
+        lo_fence = q1 - whis * iqr
+        hi_fence = q3 + whis * iqr
+        lo_whisker = data[data >= lo_fence].min()
+        hi_whisker = data[data <= hi_fence].max()
+
+        outliers = data[(data < lo_whisker) | (data > hi_whisker)]
+        outlier_stats.append((len(outliers), len(outliers) / len(data) * 100))
+
+        r = 1           if orientation == 'vertical' else idx + 1
+        c = idx + 1     if orientation == 'vertical' else 1
+
+        # Vertical boxes use y; horizontal boxes use x
+        box_data = dict(y=data) if orientation == 'vertical' else dict(x=data)
+        fig.add_trace(go.Box(
+            **box_data,
+            name='',
+            marker_color=colors[idx % len(colors)],
+            boxmean=False,
+            showlegend=False,
+            marker=dict(
+                size=5,
+                outliercolor='rgba(220,220,220,0.7)',
+                line=dict(outliercolor='rgba(220,220,220,0.7)', outlierwidth=1),
+            ),
+            line=dict(width=2),
+        ), row=r, col=c)
+
+    # ── Build outlier-stat annotations ────────────────────────────────────────
+    annotations = list(fig.layout.annotations)
+    for idx in range(n):
+        n_out, pct = outlier_stats[idx]
+
+        if orientation == 'vertical':
+            # One row, n columns → centre each annotation under its subplot
+            axis_key = 'xaxis' if idx == 0 else f'xaxis{idx + 1}'
+            domain = fig.layout[axis_key].domain
+            x_center = (domain[0] + domain[1]) / 2
+            annotations.append(dict(
+                text=f"Outliers: {n_out} ({pct:.1f}%)",
+                xref='paper', yref='paper',
+                x=x_center, y=-0.04,
+                xanchor='center', yanchor='top',
+                showarrow=False,
+                font=dict(size=11, color='#FFD700'),
+                bgcolor='rgba(0,0,0,0.5)',
+                bordercolor='#FFD700', borderwidth=1, borderpad=4,
+            ))
+        else:
+            # n rows, one column → place each annotation to the right of its row
+            axis_key = 'yaxis' if idx == 0 else f'yaxis{idx + 1}'
+            domain = fig.layout[axis_key].domain
+            y_center = (domain[0] + domain[1]) / 2
+            annotations.append(dict(
+                text=f"Outliers: {n_out} ({pct:.1f}%)",
+                xref='paper', yref='paper',
+                x=1.01, y=y_center,
+                xanchor='left', yanchor='middle',
+                showarrow=False,
+                font=dict(size=11, color='#FFD700'),
+                bgcolor='rgba(0,0,0,0.5)',
+                bordercolor='#FFD700', borderwidth=1, borderpad=4,
+            ))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    margin = (
+        dict(l=50, r=50,  t=80, b=100)   # extra bottom for below-subplot labels
+        if orientation == 'vertical' else
+        dict(l=50, r=180, t=80, b=50)    # extra right for side annotations
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=title or "Outlier Analysis",
+            font=dict(size=18, color='white'),
+            x=0.5, xanchor='center',
+        ),
+        template='plotly_dark',
+        autosize=True,          # always fill the available container width
+        height=plot_height,
+        showlegend=False,
+        paper_bgcolor='#0e1117',
+        plot_bgcolor='#1a1a1a',
+        font=dict(color='white'),
+        annotations=annotations,
+        margin=margin,
+    )
+
+    # ── Axis tick-label visibility ────────────────────────────────────────────
+    if orientation == 'vertical':
+        # Boxes are vertical (y = value range) → x labels are meaningless
+        fig.update_xaxes(showticklabels=False, showgrid=True,
+                         gridwidth=0.5, gridcolor='rgba(128,128,128,0.2)')
+        fig.update_yaxes(showticklabels=True,  showgrid=True,
+                         gridwidth=0.5, gridcolor='rgba(128,128,128,0.2)')
+    else:
+        # Boxes are horizontal (x = value range) → y labels are meaningless
+        fig.update_xaxes(showticklabels=True,  showgrid=True,
+                         gridwidth=0.5, gridcolor='rgba(128,128,128,0.2)')
+        fig.update_yaxes(showticklabels=False, showgrid=True,
+                         gridwidth=0.5, gridcolor='rgba(128,128,128,0.2)')
+
+    return fig
+
 
 
 
