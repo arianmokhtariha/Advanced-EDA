@@ -509,68 +509,55 @@ def outlier_plot(
     return fig
 
 
-"""
-schema_diagram()
-────────────────
-Drop this function into utils/custom_plots.py.
-
-Usage:
-    from utils.custom_plots import schema_diagram
-    from utils.db_utils import run_query
-
-    fig = schema_diagram(run_query)
-    fig.show()
-"""
 
 
-# ── SQL queries ───────────────────────────────────────────────────────────────
+# ── SQL queries for schema_diagram() (pg_catalog — PostgreSQL only, zero ambiguity) ────────────────
 #
-# Root cause of the duplicate-row bug:
-#   PostgreSQL only requires constraint names to be unique WITHIN a table,
-#   not across the whole schema.  In this project both `appearances` and
-#   `game_events` define a constraint called `fk_player_id`.
-#   Joining key_column_usage on (constraint_name + constraint_schema) alone
-#   therefore matches BOTH tables' constraint, producing cross-product duplicates.
+# Why pg_catalog instead of information_schema:
+#   information_schema identifies constraints by name, but PostgreSQL only
+#   requires constraint names to be unique WITHIN a table — not across the
+#   schema.  When two tables define the same constraint name (e.g. both
+#   `appearances` and `game_events` call their FK `fk_player_id`),
+#   information_schema views cannot distinguish them and any join on
+#   constraint_name cross-products the rows, producing phantom duplicates.
 #
-# Fix: join table_constraints first to get the concrete table_name for each
-# constraint, then anchor every key_column_usage join on table_name as well.
-# This guarantees exactly one row per FK column regardless of whether the
-# same constraint name is reused across different tables.
+#   pg_catalog uses OIDs (object identifiers) which are globally unique
+#   integers assigned by PostgreSQL itself — no name collision is possible.
+#   unnest(conkey, confkey) unpacks the FK and PK column-number arrays in
+#   parallel, so composite keys pair correctly without ordinal tricks.
+#   Result: exactly one row per FK column, always, regardless of naming.
 
 _FK_QUERY = """
 SELECT
-    tc_fk.table_name    AS child_table,
-    kcu_fk.column_name  AS fk_column,
-    tc_pk.table_name    AS parent_table,
-    kcu_pk.column_name  AS pk_column
-FROM information_schema.referential_constraints rc
-JOIN information_schema.table_constraints tc_fk
-    ON  tc_fk.constraint_name   = rc.constraint_name
-    AND tc_fk.constraint_schema = rc.constraint_schema
-JOIN information_schema.table_constraints tc_pk
-    ON  tc_pk.constraint_name   = rc.unique_constraint_name
-    AND tc_pk.constraint_schema = rc.unique_constraint_schema
-JOIN information_schema.key_column_usage kcu_fk
-    ON  kcu_fk.constraint_name  = rc.constraint_name
-    AND kcu_fk.constraint_schema= rc.constraint_schema
-    AND kcu_fk.table_name       = tc_fk.table_name
-JOIN information_schema.key_column_usage kcu_pk
-    ON  kcu_pk.constraint_name  = rc.unique_constraint_name
-    AND kcu_pk.constraint_schema= rc.unique_constraint_schema
-    AND kcu_pk.table_name       = tc_pk.table_name
-    AND kcu_pk.ordinal_position = kcu_fk.ordinal_position
-WHERE rc.constraint_schema = '{schema}';
+    child_cl.relname  AS child_table,
+    child_at.attname  AS fk_column,
+    parent_cl.relname AS parent_table,
+    parent_at.attname AS pk_column
+FROM pg_catalog.pg_constraint  con
+JOIN pg_catalog.pg_class       child_cl  ON child_cl.oid  = con.conrelid
+JOIN pg_catalog.pg_namespace   child_ns  ON child_ns.oid  = child_cl.relnamespace
+JOIN pg_catalog.pg_class       parent_cl ON parent_cl.oid = con.confrelid
+CROSS JOIN LATERAL unnest(con.conkey, con.confkey) AS cols(child_col, parent_col)
+JOIN pg_catalog.pg_attribute   child_at
+    ON child_at.attrelid = con.conrelid  AND child_at.attnum = cols.child_col
+JOIN pg_catalog.pg_attribute   parent_at
+    ON parent_at.attrelid = con.confrelid AND parent_at.attnum = cols.parent_col
+WHERE con.contype   = 'f'
+  AND child_ns.nspname = '{schema}';
 """
 
 _TABLES_QUERY = """
-SELECT table_name
-FROM information_schema.tables
-WHERE table_schema = '{schema}'
-  AND table_type   = 'BASE TABLE';
+SELECT c.relname AS table_name
+FROM pg_catalog.pg_class     c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = '{schema}'
+  AND c.relkind = 'r';
 """
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+
+
+# ── Internal helpers for schema_diagram() ──────────────────────────────────────────────────────────
 
 def _get_pos(G: nx.DiGraph, layout: str, seed: int, spring_k: float) -> dict:
     if layout == "spring":
