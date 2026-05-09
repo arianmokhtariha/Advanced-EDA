@@ -270,20 +270,23 @@ def distribution_plot(
     
     # Update layout for dark mode
     fig.update_layout(
-        template='plotly_dark',
-        height=height,
-        width=figsize[0],
-        title_text=title,
-        title_font_size=24,
-        title_x=0.5,
-        showlegend=False,  # Disable global legend
-        plot_bgcolor='#0e1117',
-        paper_bgcolor='#0e1117',
-        font=dict(color='#fafafa', size=12),
-        uniformtext_minsize=8,
-        uniformtext_mode='hide',
-        annotations=stats_annotations  # Add all stat annotations
+    template='plotly_dark',
+    height=height,
+    width=figsize[0],
+    title_text=title,
+    title_font_size=24,
+    title_x=0.5,
+    showlegend=False,
+    plot_bgcolor='#0e1117',
+    paper_bgcolor='#0e1117',
+    font=dict(color='#fafafa', size=12),
+    uniformtext_minsize=8,
+    uniformtext_mode='hide',
     )
+
+    fig.update_layout(
+    annotations=list(fig.layout.annotations) + stats_annotations
+)
     
     # Update axes
     fig.update_xaxes(
