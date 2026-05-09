@@ -322,6 +322,7 @@ def outlier_plot(
     ignore_list: Optional[List[str]] = None,
     whis: float = 1.5,
     orientation: Literal['horizontal', 'vertical'] = 'horizontal',
+    n_cols: int = 2,
     title: Optional[str] = "Box Plot Overview"
 ) -> go.Figure:
     """
@@ -337,10 +338,11 @@ def outlier_plot(
     whis : float, default 1.5
         IQR multiplier for whisker / outlier fence calculation.
     orientation : {'vertical', 'horizontal'}, default 'horizontal'
-        'vertical'   – subplots arranged **side-by-side** (one row);
-                       boxes are drawn vertically (value on y-axis).
-        'horizontal' – subplots **stacked** (one column per row);
-                       boxes are drawn horizontally (value on x-axis).
+        'vertical'   – boxes are drawn vertically (value on y-axis).
+        'horizontal' – boxes are drawn horizontally (value on x-axis).
+    n_cols : int, default 2
+        Number of columns in the subplot grid. Rows are calculated
+        automatically as ceil(n_numerical_cols / n_cols).
     title : str, optional
         Main figure title.
 
@@ -361,21 +363,29 @@ def outlier_plot(
               '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52']
 
     # ── Layout dimensions ─────────────────────────────────────────────────────
-    if orientation == 'vertical':
-        # Side-by-side subplots, one row — boxes are vertical (y = value)
-        rows, cols_n = 1, n
-        h_spacing = max(0.01, min(0.04, 0.5 / n))
+    n_rows = int(np.ceil(n / n_cols))
+    cols_n = n_cols
+
+    # Dynamic spacing — tightens as the grid grows to maximise plot area
+    if n_cols <= 2:
+        h_spacing = 0.10
         v_spacing = 0.12
-        plot_height = 480
-    else:
-        # Stacked subplots, one column per row — boxes are horizontal (x = value)
-        rows, cols_n = n, 1
-        h_spacing = 0.04
-        v_spacing = max(0.03, min(0.12, 0.6 / n))
-        plot_height = n * 280
+    elif n_cols == 3:
+        h_spacing = 0.07
+        v_spacing = 0.11
+    elif n_cols == 4:
+        h_spacing = 0.05
+        v_spacing = 0.10
+    else:  # 5+ columns
+        h_spacing = 0.03
+        v_spacing = 0.08
+
+    # Dynamic per-row height: progressively compact for larger grids
+    per_row_h = 380 if n_rows <= 3 else (320 if n_rows <= 6 else 270)
+    plot_height = n_rows * per_row_h
 
     fig = make_subplots(
-        rows=rows, cols=cols_n,
+        rows=n_rows, cols=cols_n,
         subplot_titles=numerical_cols,
         horizontal_spacing=h_spacing,
         vertical_spacing=v_spacing,
@@ -397,8 +407,8 @@ def outlier_plot(
         outliers = data[(data < lo_whisker) | (data > hi_whisker)]
         outlier_stats.append((len(outliers), len(outliers) / len(data) * 100))
 
-        r = 1           if orientation == 'vertical' else idx + 1
-        c = idx + 1     if orientation == 'vertical' else 1
+        r = idx // n_cols + 1
+        c = idx % n_cols + 1
 
         # Vertical boxes use y; horizontal boxes use x
         box_data = dict(y=data) if orientation == 'vertical' else dict(x=data)
@@ -420,16 +430,20 @@ def outlier_plot(
     annotations = list(fig.layout.annotations)
     for idx in range(n):
         n_out, pct = outlier_stats[idx]
+        axis_idx = '' if idx == 0 else str(idx + 1)
+        x_axis_key = f'xaxis{axis_idx}'
+        y_axis_key = f'yaxis{axis_idx}'
+        x_domain = fig.layout[x_axis_key].domain
+        y_domain = fig.layout[y_axis_key].domain
 
         if orientation == 'vertical':
-            # One row, n columns → centre each annotation under its subplot
-            axis_key = 'xaxis' if idx == 0 else f'xaxis{idx + 1}'
-            domain = fig.layout[axis_key].domain
-            x_center = (domain[0] + domain[1]) / 2
+            # Boxes are vertical → annotate below each subplot using its own domains
+            x_center = (x_domain[0] + x_domain[1]) / 2
+            y_bottom = y_domain[0] - 0.02
             annotations.append(dict(
                 text=f"Outliers: {n_out} ({pct:.1f}%)",
                 xref='paper', yref='paper',
-                x=x_center, y=-0.04,
+                x=x_center, y=y_bottom,
                 xanchor='center', yanchor='top',
                 showarrow=False,
                 font=dict(size=11, color='#FFD700'),
@@ -437,14 +451,13 @@ def outlier_plot(
                 bordercolor='#FFD700', borderwidth=1, borderpad=4,
             ))
         else:
-            # n rows, one column → place each annotation to the right of its row
-            axis_key = 'yaxis' if idx == 0 else f'yaxis{idx + 1}'
-            domain = fig.layout[axis_key].domain
-            y_center = (domain[0] + domain[1]) / 2
+            # Boxes are horizontal → annotate to the right of each subplot using its own domains
+            x_right = x_domain[1] + 0.01
+            y_center = (y_domain[0] + y_domain[1]) / 2
             annotations.append(dict(
                 text=f"Outliers: {n_out} ({pct:.1f}%)",
                 xref='paper', yref='paper',
-                x=1.01, y=y_center,
+                x=x_right, y=y_center,
                 xanchor='left', yanchor='middle',
                 showarrow=False,
                 font=dict(size=11, color='#FFD700'),
@@ -454,9 +467,9 @@ def outlier_plot(
 
     # ── Layout ────────────────────────────────────────────────────────────────
     margin = (
-        dict(l=50, r=50,  t=80, b=100)   # extra bottom for below-subplot labels
+        dict(l=50, r=50, t=80, b=80)    # extra bottom for below-subplot labels
         if orientation == 'vertical' else
-        dict(l=50, r=180, t=80, b=50)    # extra right for side annotations
+        dict(l=50, r=180, t=80, b=50)   # extra right for side annotations per column
     )
 
     fig.update_layout(
