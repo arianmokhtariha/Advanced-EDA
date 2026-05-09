@@ -116,7 +116,7 @@ CREATE TABLE game_events
 """
 
 # CSV to table mapping: {rel_csv_path: table_name}
-# (Important) Ordered by dependency to ensure parent records exist before child records
+# (Important) Order by dependency to ensure parent records exist before child records
 CSV_TABLE_MAPPING = {
     r"data/competitions.csv" : "competitions",
     r"data/clubs.csv" : "clubs",

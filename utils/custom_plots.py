@@ -522,23 +522,44 @@ Usage:
     fig.show()
 """
 
-# ── SQL queries for schema_diagram() (information_schema — portable across any PostgreSQL DB) ──────
+
+# ── SQL queries ───────────────────────────────────────────────────────────────
+#
+# Root cause of the duplicate-row bug:
+#   PostgreSQL only requires constraint names to be unique WITHIN a table,
+#   not across the whole schema.  In this project both `appearances` and
+#   `game_events` define a constraint called `fk_player_id`.
+#   Joining key_column_usage on (constraint_name + constraint_schema) alone
+#   therefore matches BOTH tables' constraint, producing cross-product duplicates.
+#
+# Fix: join table_constraints first to get the concrete table_name for each
+# constraint, then anchor every key_column_usage join on table_name as well.
+# This guarantees exactly one row per FK column regardless of whether the
+# same constraint name is reused across different tables.
 
 _FK_QUERY = """
 SELECT
-    kcu.table_name   AS child_table,
-    kcu.column_name  AS fk_column,
-    ccu.table_name   AS parent_table,
-    ccu.column_name  AS pk_column
-FROM information_schema.table_constraints       AS tc
-JOIN information_schema.key_column_usage        AS kcu
-    ON tc.constraint_name = kcu.constraint_name
-    AND tc.table_schema   = kcu.table_schema
-JOIN information_schema.constraint_column_usage AS ccu
-    ON ccu.constraint_name = tc.constraint_name
-    AND ccu.table_schema   = tc.table_schema
-WHERE tc.constraint_type = 'FOREIGN KEY'
-  AND tc.table_schema    = '{schema}';
+    tc_fk.table_name    AS child_table,
+    kcu_fk.column_name  AS fk_column,
+    tc_pk.table_name    AS parent_table,
+    kcu_pk.column_name  AS pk_column
+FROM information_schema.referential_constraints rc
+JOIN information_schema.table_constraints tc_fk
+    ON  tc_fk.constraint_name   = rc.constraint_name
+    AND tc_fk.constraint_schema = rc.constraint_schema
+JOIN information_schema.table_constraints tc_pk
+    ON  tc_pk.constraint_name   = rc.unique_constraint_name
+    AND tc_pk.constraint_schema = rc.unique_constraint_schema
+JOIN information_schema.key_column_usage kcu_fk
+    ON  kcu_fk.constraint_name  = rc.constraint_name
+    AND kcu_fk.constraint_schema= rc.constraint_schema
+    AND kcu_fk.table_name       = tc_fk.table_name
+JOIN information_schema.key_column_usage kcu_pk
+    ON  kcu_pk.constraint_name  = rc.unique_constraint_name
+    AND kcu_pk.constraint_schema= rc.unique_constraint_schema
+    AND kcu_pk.table_name       = tc_pk.table_name
+    AND kcu_pk.ordinal_position = kcu_fk.ordinal_position
+WHERE rc.constraint_schema = '{schema}';
 """
 
 _TABLES_QUERY = """
@@ -549,7 +570,7 @@ WHERE table_schema = '{schema}'
 """
 
 
-# ── Internal helpers for schema_diagram() ──────────────────────────────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _get_pos(G: nx.DiGraph, layout: str, seed: int, spring_k: float) -> dict:
     if layout == "spring":
@@ -570,10 +591,7 @@ def _get_pos(G: nx.DiGraph, layout: str, seed: int, spring_k: float) -> dict:
 
 
 def _separate_nodes(pos: dict, min_dist: float = 0.28, iterations: int = 100) -> dict:
-    """
-    FIX: Iteratively push any two nodes that are closer than min_dist apart.
-    Prevents the kamada_kawai layout from stacking nodes on the same spot.
-    """
+    """Push nodes apart when the layout places two of them too close together."""
     pos = {k: list(v) for k, v in pos.items()}
     nodes = list(pos.keys())
     for _ in range(iterations):
@@ -586,10 +604,7 @@ def _separate_nodes(pos: dict, min_dist: float = 0.28, iterations: int = 100) ->
                 dist = math.sqrt(dx ** 2 + dy ** 2)
                 if dist < min_dist:
                     push = (min_dist - dist) / 2 + 1e-6
-                    if dist > 1e-9:
-                        ux, uy = dx / dist, dy / dist
-                    else:                        # exact overlap: push horizontally
-                        ux, uy = 1.0, 0.0
+                    ux, uy = (dx / dist, dy / dist) if dist > 1e-9 else (1.0, 0.0)
                     pos[u][0] += ux * push
                     pos[u][1] += uy * push
                     pos[v][0] -= ux * push
@@ -600,14 +615,10 @@ def _separate_nodes(pos: dict, min_dist: float = 0.28, iterations: int = 100) ->
     return {k: tuple(v) for k, v in pos.items()}
 
 
-def _perimeter_point(
-    x0: float, y0: float,   # the OTHER node (direction reference)
-    x1: float, y1: float,   # the node whose perimeter we want
-    r: float,               # node radius in data-coord units
-) -> tuple[float, float]:
+def _perimeter_point(x0, y0, x1, y1, r):
     """
-    FIX: Return the perimeter point of node at (x1,y1) facing toward (x0,y0).
-    Used to stop edge lines and arrowheads AT the node boundary, not inside it.
+    Return the point on the perimeter of node at (x1,y1) facing (x0,y0).
+    Stops edges and arrowheads at the node boundary, not inside it.
     """
     dx, dy = x1 - x0, y1 - y0
     dist = math.sqrt(dx ** 2 + dy ** 2)
@@ -617,20 +628,16 @@ def _perimeter_point(
     return x0 + dx * ratio, y0 + dy * ratio
 
 
-def _estimate_node_radius(
-    pos: dict, node_size: int, fig_width: int, fig_height: int
-) -> float:
-    """
-    Convert node_size (pixels, diameter) to data-coordinate units.
-    Accounts for Plotly's automatic axis padding (~30 % per side).
-    """
+def _estimate_node_radius(pos: dict, node_size: int,
+                           fig_width: int, fig_height: int) -> float:
+    """Convert node_size (px diameter) to data-coordinate units."""
     xs = [p[0] for p in pos.values()]
     ys = [p[1] for p in pos.values()]
     x_span = (max(xs) - min(xs)) or 1.0
     y_span = (max(ys) - min(ys)) or 1.0
-    eff_w = (fig_width  - 40) * 0.70
-    eff_h = (fig_height - 80) * 0.70
-    r_x = (node_size / 2) / (eff_w  / x_span)
+    eff_w  = (fig_width  - 40) * 0.70
+    eff_h  = (fig_height - 80) * 0.70
+    r_x = (node_size / 2) / (eff_w / x_span)
     r_y = (node_size / 2) / (eff_h / y_span)
     return (r_x + r_y) / 2
 
@@ -657,7 +664,7 @@ def schema_diagram(
     arrow_size: float = 1.2,
     # — Edge labels
     edge_labels: Literal["hover", "always", "none"] = "hover",
-    edge_label_font_size: int = 8,
+    edge_label_font_size: int = 10,
     edge_label_color: str = "#94A3B8",
     # — Figure
     title: str = "Database Schema – Table Relationships",
@@ -702,9 +709,10 @@ def schema_diagram(
         'always' — FK column names rendered directly on the diagram
         'none'   — no FK labels at all
     edge_label_font_size : int
-        Font size for always-on edge labels.
+        Font size for edge labels (both hover tooltip and always-on).
+        Default 10. Increase for larger text, e.g. 12 or 14.
     edge_label_color : str
-        Colour for edge label text.
+        Colour for always-on edge label text.
     title : str
         Figure title.
     height : int
@@ -732,8 +740,8 @@ def schema_diagram(
     G = nx.DiGraph()
     G.add_nodes_from(df_tables["table_name"])
 
-    # Collapse parallel FK edges: one edge per (child → parent) pair,
-    # all FK→PK column pairs stored in a list on that edge.
+    # Collapse parallel FK edges: one graph edge per (child, parent) pair,
+    # storing all FK→PK column pairs in a list so nothing is lost.
     edge_fks: dict[tuple, list[str]] = {}
     for _, row in df_fk.iterrows():
         key   = (row["child_table"], row["parent_table"])
@@ -743,19 +751,19 @@ def schema_diagram(
     for (child, parent), labels in edge_fks.items():
         G.add_edge(child, parent, fk_labels=labels)
 
-    # ── 3. Layout + FIX: separate any overlapping nodes ──────────────────────
+    # ── 3. Layout + separate overlapping nodes ────────────────────────────────
     pos    = _get_pos(G, layout, seed, spring_k)
     pos    = _separate_nodes(pos)
     _fig_w = width or 900
     node_r = _estimate_node_radius(pos, node_size, _fig_w, height)
 
-    # ── 4. Edge lines — drawn perimeter-to-perimeter ──────────────────────────
+    # ── 4. Edge lines (perimeter-to-perimeter) ────────────────────────────────
     edge_x, edge_y = [], []
     for u, v in G.edges():
         x0, y0 = pos[u]
         x1, y1 = pos[v]
-        sx, sy = _perimeter_point(x1, y1, x0, y0, node_r)   # source perimeter
-        tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)   # target perimeter
+        sx, sy = _perimeter_point(x1, y1, x0, y0, node_r)
+        tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)
         edge_x += [sx, tx, None]
         edge_y += [sy, ty, None]
 
@@ -766,23 +774,19 @@ def schema_diagram(
         hoverinfo="none",
     )
 
-    # ── 5. FIX: arrowhead stubs — short annotations only for the head ─────────
-    # The full line already comes from edge_trace above.
-    # Each annotation covers only the last 20 % of the edge → arrowhead sits
-    # cleanly AT the node perimeter, clearly showing which direction it points.
+    # ── 5. Arrowhead stubs ────────────────────────────────────────────────────
+    # Short annotation covering only the last 20 % of each edge so the
+    # arrowhead sits cleanly at the node perimeter, not inside the node.
     annotations = []
     for u, v in G.edges():
         x0, y0 = pos[u]
         x1, y1 = pos[v]
         sx, sy = _perimeter_point(x1, y1, x0, y0, node_r)
         tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)
-
-        stub_t  = 0.80          # stub tail at 80 % along the perimeter-to-perimeter segment
-        stub_ax = sx + (tx - sx) * stub_t
-        stub_ay = sy + (ty - sy) * stub_t
-
+        stub_ax = sx + (tx - sx) * 0.80
+        stub_ay = sy + (ty - sy) * 0.80
         annotations.append(dict(
-            x=tx, y=ty,         # tip AT target perimeter
+            x=tx, y=ty,
             ax=stub_ax, ay=stub_ay,
             xref="x", yref="y",
             axref="x", ayref="y",
@@ -795,26 +799,23 @@ def schema_diagram(
             opacity=0.9,
         ))
 
-    # ── 6. FIX: edge label positions ──────────────────────────────────────────
-    # Labels placed at 35 % from the source node (not midpoint).
-    # A perpendicular nudge separates labels on edges that converge on the same
-    # hub node, preventing them from stacking into an unreadable pile.
+    # ── 6. Edge labels ────────────────────────────────────────────────────────
+    # Placed at 35 % from source + perpendicular nudge to separate labels on
+    # edges that converge on the same hub node.
     lbl_x, lbl_y, hover_texts, always_texts = [], [], [], []
     for u, v, data in G.edges(data=True):
         x0, y0 = pos[u]
         x1, y1 = pos[v]
 
-        t  = 0.35
-        lx = x0 + (x1 - x0) * t
-        ly = y0 + (y1 - y0) * t
+        lx = x0 + (x1 - x0) * 0.35
+        ly = y0 + (y1 - y0) * 0.35
 
         elen = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
         if elen > 1e-9:
             perp_x = -(y1 - y0) / elen
             perp_y =  (x1 - x0) / elen
-            nudge  = node_r * 0.9
-            lx    += perp_x * nudge
-            ly    += perp_y * nudge
+            lx += perp_x * node_r * 0.9
+            ly += perp_y * node_r * 0.9
 
         lbl_x.append(lx)
         lbl_y.append(ly)
@@ -830,9 +831,9 @@ def schema_diagram(
         label_trace = go.Scatter(
             x=lbl_x, y=lbl_y,
             mode="markers",
-            marker=dict(size=10, color="rgba(0,0,0,0)"),    # invisible hit-target
+            marker=dict(size=10, color="rgba(0,0,0,0)"),
             hovertemplate=[f"{h}<extra></extra>" for h in hover_texts],
-            hoverlabel=dict(bgcolor="#1e1e2e", font_size=11),
+            hoverlabel=dict(bgcolor="#1e1e2e", font_size=edge_label_font_size),
         )
     elif edge_labels == "always":
         label_trace = go.Scatter(
@@ -841,9 +842,9 @@ def schema_diagram(
             text=always_texts,
             textfont=dict(size=edge_label_font_size, color=edge_label_color),
             hovertemplate=[f"{h}<extra></extra>" for h in hover_texts],
-            hoverlabel=dict(bgcolor="#1e1e2e", font_size=11),
+            hoverlabel=dict(bgcolor="#1e1e2e", font_size=edge_label_font_size),
         )
-    else:                                                    # "none"
+    else:
         label_trace = go.Scatter(
             x=lbl_x, y=lbl_y,
             mode="markers",
