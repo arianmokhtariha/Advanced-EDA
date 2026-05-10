@@ -512,20 +512,7 @@ def outlier_plot(
 
 
 # ── SQL queries for schema_diagram() (pg_catalog — PostgreSQL only, zero ambiguity) ────────────────
-#
-# Why pg_catalog instead of information_schema:
-#   information_schema identifies constraints by name, but PostgreSQL only
-#   requires constraint names to be unique WITHIN a table — not across the
-#   schema.  When two tables define the same constraint name (e.g. both
-#   `appearances` and `game_events` call their FK `fk_player_id`),
-#   information_schema views cannot distinguish them and any join on
-#   constraint_name cross-products the rows, producing phantom duplicates.
-#
-#   pg_catalog uses OIDs (object identifiers) which are globally unique
-#   integers assigned by PostgreSQL itself — no name collision is possible.
-#   unnest(conkey, confkey) unpacks the FK and PK column-number arrays in
-#   parallel, so composite keys pair correctly without ordinal tricks.
-#   Result: exactly one row per FK column, always, regardless of naming.
+
 
 _FK_QUERY = """
 SELECT
@@ -554,6 +541,39 @@ WHERE n.nspname = '{schema}'
   AND c.relkind = 'r';
 """
 
+#   Why pg_catalog instead of information_schema:
+#   information_schema identifies constraints by name, but PostgreSQL only
+#   requires constraint names to be unique WITHIN a table — not across the
+#   schema.  When two tables define the same constraint name (e.g. both
+#   `appearances` and `game_events` call their FK `fk_player_id`),
+#   information_schema views cannot distinguish them and any join on
+#   constraint_name cross-products the rows, producing phantom duplicates.
+#
+#   pg_catalog uses OIDs (object identifiers) which are globally unique
+#   integers assigned by PostgreSQL itself — no name collision is possible.
+#   unnest(conkey, confkey) unpacks the FK and PK column-number arrays in
+#   parallel, so composite keys pair correctly without ordinal tricks.
+#   Result: exactly one row per FK column, always, regardless of naming.
+
+_COLUMNS_QUERY = """
+SELECT
+    c.relname                                        AS table_name,
+    a.attname                                        AS column_name,
+    pg_catalog.format_type(a.atttypid, a.atttypmod)  AS data_type
+FROM pg_catalog.pg_attribute  a
+JOIN pg_catalog.pg_class      c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace  n ON n.oid = c.relnamespace
+WHERE n.nspname  = '{schema}'
+  AND c.relkind  = 'r'
+  AND a.attnum   > 0
+  AND NOT a.attisdropped
+ORDER BY c.relname, a.attnum;
+"""
+
+#   Same reasoning as _FK_QUERY: pg_catalog OIDs guarantee uniqueness per
+#   column (attnum is the 1-based ordinal position within its table), so
+#   the ORDER BY c.relname, a.attnum always returns columns in the original
+#   CREATE TABLE order — independent of any name the user may have given.
 
 
 
@@ -719,9 +739,17 @@ def schema_diagram(
     # ── 1. Fetch live schema ──────────────────────────────────────────────────
     df_fk     = run_query_fn(_FK_QUERY.format(schema=schema))
     df_tables = run_query_fn(_TABLES_QUERY.format(schema=schema))
+    df_cols   = run_query_fn(_COLUMNS_QUERY.format(schema=schema))
 
-    if df_fk is None or df_tables is None:
+    if df_fk is None or df_tables is None or df_cols is None:
         raise RuntimeError("Could not fetch schema — check your DB connection.")
+
+    # Build table → [column (type), …] map for node hover tooltips
+    table_cols: dict[str, list[str]] = {}
+    for _, row in df_cols.iterrows():
+        table_cols.setdefault(row["table_name"], []).append(
+            f"{row['column_name']}  ({row['data_type']})"
+        )
 
     # ── 2. Build graph ────────────────────────────────────────────────────────
     G = nx.DiGraph()
@@ -853,10 +881,14 @@ def schema_diagram(
         textposition="top center",
         textfont=dict(size=node_font_size, color="white"),
         hovertemplate=[
-            f"<b>{n}</b><br>"
-            f"Referenced by {i} table(s)<br>"
-            f"References {o} table(s)"
-            f"<extra></extra>"
+            (
+                f"<b>{n}</b><br>"
+                f"Referenced by {i} table(s)<br>"
+                f"References {o} table(s)<br>"
+                f"──────────────────<br>"
+                + "<br>".join(table_cols.get(n, ["(no columns found)"]))
+                + "<extra></extra>"
+            )
             for n, i, o in zip(node_names, in_degrees, out_degrees)
         ],
         hoverlabel=dict(bgcolor="#1e1e2e", font_size=12),
