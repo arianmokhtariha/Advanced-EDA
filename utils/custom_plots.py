@@ -454,14 +454,14 @@ def outlier_plot(
                 bordercolor='#FFD700', borderwidth=1, borderpad=4,
             ))
         else:
-            # Boxes are horizontal → annotate to the right of each subplot using its own domains
-            x_right = x_domain[1] + 0.01
-            y_center = (y_domain[0] + y_domain[1]) / 2
+            # Boxes are horizontal → annotate INSIDE the subplot, top-right corner
+            x_right  = x_domain[1] - 0.005   # just inside the right edge
+            y_top    = y_domain[1]            # top of the subplot domain
             annotations.append(dict(
                 text=f"Outliers: {n_out} ({pct:.1f}%)",
                 xref='paper', yref='paper',
-                x=x_right, y=y_center,
-                xanchor='left', yanchor='middle',
+                x=x_right, y=y_top,
+                xanchor='right', yanchor='top',   # anchor pulls it inward
                 showarrow=False,
                 font=dict(size=11, color='#FFD700'),
                 bgcolor='rgba(0,0,0,0.5)',
@@ -469,11 +469,6 @@ def outlier_plot(
             ))
 
     # ── Layout ────────────────────────────────────────────────────────────────
-    margin = (
-        dict(l=50, r=50, t=80, b=80)    # extra bottom for below-subplot labels
-        if orientation == 'vertical' else
-        dict(l=50, r=180, t=80, b=50)   # extra right for side annotations per column
-    )
 
     fig.update_layout(
         title=dict(
@@ -489,7 +484,6 @@ def outlier_plot(
         plot_bgcolor='#1a1a1a',
         font=dict(color='white'),
         annotations=annotations,
-        margin=margin,
     )
 
     # ── Axis tick-label visibility ────────────────────────────────────────────
