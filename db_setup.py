@@ -208,7 +208,7 @@ class Spinner:
         return False
 
 # ============================================
-# FUNCTIONS (no need to modify)
+# FUNCTIONS 
 # ============================================
 
 def _print_header(title: str):
