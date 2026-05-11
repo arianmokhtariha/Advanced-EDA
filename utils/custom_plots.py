@@ -326,7 +326,8 @@ def outlier_plot(
     whis: float = 1.5,
     orientation: Literal['horizontal', 'vertical'] = 'horizontal',
     n_cols: int = 2,
-    title: Optional[str] = "Box Plot Overview"
+    title: Optional[str] = "Box Plot Overview",
+    width: int = 1400
 ) -> go.Figure:
     """
     Create box plots for numerical columns with outlier detection.
@@ -477,7 +478,7 @@ def outlier_plot(
             x=0.5, xanchor='center',
         ),
         template='plotly_dark',
-        autosize=True,          # always fill the available container width
+        width=width,
         height=plot_height,
         showlegend=False,
         paper_bgcolor='#0e1117',
