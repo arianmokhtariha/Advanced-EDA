@@ -10,7 +10,7 @@ from pathlib import Path
 from db_config import DB_CONFIG, DB_CONFIG_INIT
 
 
-# Note: Only change SCHEMA_SQL and CSV_TABLE_MAPPING for different projects
+# Personal Note: Only change SCHEMA_SQL and CSV_TABLE_MAPPING for different projects
 
 # Schema definition: list of CREATE TABLE statements
 # (Important) Ordered by dependency to avoid Foreign Key violations
