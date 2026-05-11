@@ -671,7 +671,7 @@ def schema_diagram(
     # — Figure
     title: str = "Database Schema – Table Relationships",
     height: int = 650,
-    width: Optional[int] = None,
+    width: Optional[int] = 1400,
     template: str = "plotly_dark",
     paper_bgcolor: str = "#0e1117",
 ) -> go.Figure:
