@@ -43,6 +43,17 @@ def execute_ddl(query: str, params: Optional[dict] = None) -> bool:
     """
     Executes DDL/DML statements (ALTER, CREATE, UPDATE, DELETE, etc.).
     Auto-commits on success, rolls back on error.
+    
+    Args:
+        query: SQL DDL/DML statement to execute
+        params: Optional parameters for parameterized queries
+        
+    Returns:
+        bool: True if successful
+        
+    Raises:
+        RuntimeError: If database connection fails
+        SQLAlchemyError: If SQL execution fails
     """
 
     engine = get_engine()
