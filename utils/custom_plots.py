@@ -17,262 +17,219 @@ def distribution_plot(
     show_mean_line: bool = True,
     show_median_line: bool = True,
     categorical_threshold: int = 10,
-    figsize: tuple = (1400, None)  # Width fixed, height auto-calculated
+    figsize: tuple = (1400, None),
 ) -> go.Figure:
     """
     Create comprehensive EDA visualization for all columns in a DataFrame.
-    
-    Parameters:
-    -----------
+
+    Parameters
+    ----------
     df : pd.DataFrame
-        Input dataframe to analyze
-    title : str, default='Distribution Overview'
-        Main title for the plot
-    ignore_cols : List[str], optional
-        Column names to exclude from visualization
-    top_n_categories : int, default=10
-        Maximum number of categories to show individually (rest grouped as "Other")
-    n_cols : int, default=2
-        Number of columns in the subplot grid
-    show_mean_line : bool, default=True
-        Show mean line on numerical plots
-    show_median_line : bool, default=True
-        Show median line on numerical plots
-    categorical_threshold : int, default=10
-        Treat numerical columns with fewer unique values as categorical
-    figsize : tuple, default=(1400, None)
-        Figure size (width, height). Height auto-calculated if None
-    
-    Returns:
-    --------
+        Input dataframe to analyze.
+    title : str
+        Main title for the plot.
+    ignore_cols : list[str], optional
+        Column names to exclude from visualization.
+    top_n_categories : int
+        Maximum number of categories to show individually (rest → "Other").
+    n_cols : int
+        Number of columns in the subplot grid.
+    show_mean_line : bool
+        Overlay mean line on numerical histograms.
+    show_median_line : bool
+        Overlay median line on numerical histograms.
+    categorical_threshold : int
+        Numeric columns with fewer unique values than this are treated as categorical.
+    figsize : tuple
+        (width, height). Height is auto-calculated when None.
+
+    Returns
+    -------
     plotly.graph_objects.Figure
     """
-    
-    # Color schemes
-    numerical_colors = [
+
+    # ── Colour palettes ────────────────────────────────────────────────────────
+    NUMERICAL_COLORS = [
         '#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-        '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52'
+        '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52',
     ]
-    categorical_colors = [
+    CATEGORICAL_COLORS = [
         '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
         '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-        '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'
+        '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
     ]
-    other_color = '#4a4a4a'  # Neutral gray for "Other" category
-    
-    # Prepare columns
-    if ignore_cols is None:
-        ignore_cols = []
-    
-    cols_to_plot = [col for col in df.columns if col not in ignore_cols]
-    
-    # Remove columns with all nulls
-    cols_to_plot = [col for col in cols_to_plot if df[col].notna().sum() > 0]
-    
-    if len(cols_to_plot) == 0:
-        raise ValueError("No valid columns to plot after filtering")
-    
-    # Classify columns
-    column_types = {}
-    for col in cols_to_plot:
-        col_data = df[col].dropna()
-        
-        # Check if datetime
-        if pd.api.types.is_datetime64_any_dtype(col_data):
-            column_types[col] = 'categorical'
-        # Check if explicitly categorical or object
-        elif pd.api.types.is_categorical_dtype(col_data) or pd.api.types.is_object_dtype(col_data):
-            column_types[col] = 'categorical'
-        # Check if numeric
-        elif pd.api.types.is_numeric_dtype(col_data):
-            n_unique = col_data.nunique()
-            # Treat as categorical if low cardinality
-            if n_unique < categorical_threshold:
-                column_types[col] = 'categorical'
-            else:
-                column_types[col] = 'numerical'
-        else:
-            column_types[col] = 'categorical'
-    
-    # Calculate grid dimensions
-    n_plots = len(cols_to_plot)
-    n_rows = int(np.ceil(n_plots / n_cols))
-    
-    # Dynamic spacing — tightens as the grid grows to maximise plot area
-    if n_cols <= 2:
-        h_spacing = 0.10
-        v_spacing = 0.12
-    elif n_cols == 3:
-        h_spacing = 0.07
-        v_spacing = 0.11
-    elif n_cols == 4:
-        h_spacing = 0.05
-        v_spacing = 0.10
-    else:  # 5+ columns
-        h_spacing = 0.03
-        v_spacing = 0.08
+    OTHER_COLOR = '#4a4a4a'
 
-    # Dynamic per-row height: progressively compact for larger grids
+    # ── Column selection ───────────────────────────────────────────────────────
+    ignore_cols = ignore_cols or []
+    cols_to_plot = [
+        col for col in df.columns
+        if col not in ignore_cols and df[col].notna().any()
+    ]
+
+    if not cols_to_plot:
+        raise ValueError("No valid columns to plot after filtering.")
+
+    # ── Column type classification ─────────────────────────────────────────────
+    def _classify(col: str) -> str:
+        s = df[col].dropna()
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return 'categorical'
+        if pd.api.types.is_categorical_dtype(s) or pd.api.types.is_object_dtype(s):
+            return 'categorical'
+        if pd.api.types.is_numeric_dtype(s):
+            return 'categorical' if s.nunique() < categorical_threshold else 'numerical'
+        return 'categorical'
+
+    column_types = {col: _classify(col) for col in cols_to_plot}
+
+    # ── Grid geometry ──────────────────────────────────────────────────────────
+    n_plots = len(cols_to_plot)
+    n_rows = math.ceil(n_plots / n_cols)
+
+    spacing_map = {
+        2: (0.10, 0.12),
+        3: (0.07, 0.11),
+        4: (0.05, 0.10),
+    }
+    h_spacing, v_spacing = spacing_map.get(n_cols, (0.03, 0.08))
+
     per_row_h = 380 if n_rows <= 3 else (320 if n_rows <= 6 else 270)
     height = figsize[1] if figsize[1] is not None else n_rows * per_row_h
-    
-    # Create subplots
+
+    # ── Subplots ───────────────────────────────────────────────────────────────
     fig = make_subplots(
         rows=n_rows,
         cols=n_cols,
-        subplot_titles=[col for col in cols_to_plot],
+        subplot_titles=cols_to_plot,
         vertical_spacing=v_spacing,
-        horizontal_spacing=h_spacing
+        horizontal_spacing=h_spacing,
     )
-    
-    # Track max values for each subplot to adjust y-axis
-    subplot_max_values = {}
-    
-    # Store stats for annotations
-    stats_annotations = []
-    
-    # Plot each column
+
+    categorical_ymax: dict[tuple[int, int], float] = {}
+    stats_annotations: list[dict] = []
+
+    # ── Per-column traces ──────────────────────────────────────────────────────
     for idx, col in enumerate(cols_to_plot):
-        row = idx // n_cols + 1
-        col_pos = idx % n_cols + 1
-        color_idx = idx % len(numerical_colors)
-        
+        row     = idx // n_cols + 1
+        col_pos = idx  % n_cols + 1
         col_data = df[col].dropna()
-        
+
+        # Axis reference strings (Plotly uses 'x'/'y' for the first subplot,
+        # 'x2'/'y2' for the second, etc.)
+        axis_suffix = '' if idx == 0 else str(idx + 1)
+        xref        = f'x{axis_suffix}'
+        yref        = f'y{axis_suffix}'
+        xref_domain = f'x{axis_suffix} domain'
+        yref_domain = f'y{axis_suffix} domain'
+
         if column_types[col] == 'numerical':
-            # Numerical: Histogram
             fig.add_trace(
                 go.Histogram(
                     x=col_data,
                     name=col,
-                    marker_color=numerical_colors[color_idx],
+                    marker_color=NUMERICAL_COLORS[idx % len(NUMERICAL_COLORS)],
                     showlegend=False,
-                    autobinx=True
+                    autobinx=True,
                 ),
-                row=row,
-                col=col_pos
+                row=row, col=col_pos,
             )
-            
-            mean_val = col_data.mean()
+
+            mean_val   = col_data.mean()
             median_val = col_data.median()
-            
-            # Determine the correct axis references
-            if idx == 0:
-                xref = 'x'
-                yref = 'y'
-                xref_domain = 'x domain'
-                yref_domain = 'y domain'
-            else:
-                xref = f'x{idx + 1}'
-                yref = f'y{idx + 1}'
-                xref_domain = f'x{idx + 1} domain'
-                yref_domain = f'y{idx + 1} domain'
-            
-            # Add mean line
+
             if show_mean_line:
                 fig.add_shape(
                     type='line',
-                    x0=mean_val,
-                    x1=mean_val,
-                    y0=0,
-                    y1=1,
-                    yref=yref_domain,
-                    xref=xref,
-                    line=dict(color='#FFD700', width=2.5, dash='dash')
+                    x0=mean_val, x1=mean_val, y0=0, y1=1,
+                    xref=xref, yref=yref_domain,
+                    line=dict(color='#FFD700', width=2.5, dash='dash'),
                 )
-            
-            # Add median line
             if show_median_line:
                 fig.add_shape(
                     type='line',
-                    x0=median_val,
-                    x1=median_val,
-                    y0=0,
-                    y1=1,
-                    yref=yref_domain,
-                    xref=xref,
-                    line=dict(color='#FF6B6B', width=2.5, dash='dot')
+                    x0=median_val, x1=median_val, y0=0, y1=1,
+                    xref=xref, yref=yref_domain,
+                    line=dict(color='#FF6B6B', width=2.5, dash='dot'),
                 )
-            
-            # Create annotation text for this subplot
+
             annotation_lines = []
             if show_mean_line:
                 annotation_lines.append(f'<span style="color:#FFD700;">━━</span> Mean: {mean_val:.2f}')
             if show_median_line:
                 annotation_lines.append(f'<span style="color:#FF6B6B;">⋯⋯</span> Median: {median_val:.2f}')
-            
+
             if annotation_lines:
-                stats_annotations.append({
-                    'text': '<br>'.join(annotation_lines),
-                    'xref': xref_domain,
-                    'yref': yref_domain,
-                    'x': 0.98,  # Top right of subplot
-                    'y': 0.98,
-                    'xanchor': 'right',
-                    'yanchor': 'top',
-                    'showarrow': False,
-                    'font': dict(size=10, color='#fafafa'),
-                    'bgcolor': 'rgba(0,0,0,0.6)',
-                    'bordercolor': '#2d2d2d',
-                    'borderwidth': 1,
-                    'borderpad': 4
-                })
-        
-        else:
-            # Categorical: Bar chart with percentages
+                stats_annotations.append(dict(
+                    text='<br>'.join(annotation_lines),
+                    xref=xref_domain, yref=yref_domain,
+                    x=0.98, y=0.98,
+                    xanchor='right', yanchor='top',
+                    showarrow=False,
+                    font=dict(size=10, color='#fafafa'),
+                    bgcolor='rgba(0,0,0,0.6)',
+                    bordercolor='#2d2d2d',
+                    borderwidth=1,
+                    borderpad=4,
+                ))
+
+        else:  # categorical
             value_counts = col_data.value_counts()
-            total = len(col_data)
-            percentages = (value_counts / total * 100).round(2)
-            
-            # Handle top N categories
+            total        = len(col_data)
+
             if len(value_counts) > top_n_categories:
-                top_categories = value_counts.head(top_n_categories)
-                other_count = value_counts.iloc[top_n_categories:].sum()
-                other_pct = (other_count / total * 100).round(2)
-                
-                categories = list(top_categories.index) + ['Other']
-                values = list(top_categories.values) + [other_count]
-                pcts = list(percentages.head(top_n_categories)) + [other_pct]
-                colors = [categorical_colors[i % len(categorical_colors)] 
-                         for i in range(top_n_categories)] + [other_color]
+                top  = value_counts.head(top_n_categories)
+                rest = value_counts.iloc[top_n_categories:].sum()
+                categories = [*top.index,  'Other']
+                counts     = [*top.values, rest]
+                colors     = [
+                    CATEGORICAL_COLORS[i % len(CATEGORICAL_COLORS)]
+                    for i in range(top_n_categories)
+                ] + [OTHER_COLOR]
             else:
                 categories = list(value_counts.index)
-                values = list(value_counts.values)
-                pcts = list(percentages)
-                colors = [categorical_colors[i % len(categorical_colors)] 
-                         for i in range(len(categories))]
-            
-            # Sort by frequency (descending)
-            sorted_data = sorted(zip(categories, values, pcts, colors), 
-                               key=lambda x: x[1], reverse=True)
-            categories, values, pcts, colors = zip(*sorted_data)
-            
-            # Store max value for y-axis adjustment
-            subplot_max_values[(row, col_pos)] = max(values)
-            
-            # Create hover text with percentages
-            hover_text = [f"{cat}<br>Count: {val}<br>Percentage: {pct}%" 
-                         for cat, val, pct in zip(categories, values, pcts)]
-            
+                counts     = list(value_counts.values)
+                colors     = [
+                    CATEGORICAL_COLORS[i % len(CATEGORICAL_COLORS)]
+                    for i in range(len(categories))
+                ]
+
+            pcts = [round(c / total * 100, 2) for c in counts]
+
+            # Sort descending by count
+            order      = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)
+            categories = [categories[i] for i in order]
+            counts     = [counts[i]     for i in order]
+            pcts       = [pcts[i]       for i in order]
+            colors     = [colors[i]     for i in order]
+
+            # ── FIX: give the tallest bar enough room so its outside label
+            #    is never clipped.  1.25× headroom (vs the old 1.15×) combined
+            #    with disabling uniformtext_mode='hide' (see layout below)
+            #    guarantees the label always renders.
+            categorical_ymax[(row, col_pos)] = max(counts) * 1.25
+
             fig.add_trace(
                 go.Bar(
-                    x=list(categories),
-                    y=list(values),
+                    x=categories,
+                    y=counts,
                     name=col,
-                    marker_color=list(colors),
+                    marker_color=colors,
                     showlegend=False,
-                    text=[f"{pct}%" for pct in pcts],
+                    text=[f'{p}%' for p in pcts],
                     textposition='outside',
                     textfont=dict(size=10),
-                    hovertext=hover_text,
+                    hovertext=[
+                        f'{cat}<br>Count: {n}<br>Percentage: {p}%'
+                        for cat, n, p in zip(categories, counts, pcts)
+                    ],
                     hoverinfo='text',
-                    cliponaxis=False
+                    cliponaxis=False,
                 ),
-                row=row,
-                col=col_pos
+                row=row, col=col_pos,
             )
-    
-    # Update layout for dark mode
+
+    # ── Layout ─────────────────────────────────────────────────────────────────
     fig.update_layout(
         template='plotly_dark',
         height=height,
@@ -285,37 +242,31 @@ def distribution_plot(
         plot_bgcolor='#0e1117',
         paper_bgcolor='#0e1117',
         font=dict(color='#fafafa', size=12),
+        # ── FIX: 'hide' was silently suppressing the label on the tallest bar
+        #    because Plotly couldn't fit it at the uniform minimum size within
+        #    the (too-tight) headroom.  'show' forces all labels to render.
         uniformtext_minsize=8,
-        uniformtext_mode='hide',
+        uniformtext_mode='show',
+        annotations=list(fig.layout.annotations) + stats_annotations,
     )
 
-    fig.update_layout(
-    annotations=list(fig.layout.annotations) + stats_annotations
-)
-    
-    # Update axes
     fig.update_xaxes(
-        showgrid=True, 
-        gridwidth=0.5, 
+        showgrid=True,
+        gridwidth=0.5,
         gridcolor='#2d2d2d',
         tickangle=-45,
-        tickfont=dict(size=10)
+        tickfont=dict(size=10),
     )
-    
     fig.update_yaxes(
-        showgrid=True, 
-        gridwidth=0.5, 
-        gridcolor='#2d2d2d'
+        showgrid=True,
+        gridwidth=0.5,
+        gridcolor='#2d2d2d',
     )
-    
-    # Adjust y-axis range for categorical plots to prevent text cutoff
-    for (row, col_pos), max_val in subplot_max_values.items():
-        fig.update_yaxes(
-            range=[0, max_val * 1.15],
-            row=row,
-            col=col_pos
-        )
-    
+
+    # Apply per-subplot y-axis ceiling for categorical plots
+    for (r, c), ymax in categorical_ymax.items():
+        fig.update_yaxes(range=[0, ymax], row=r, col=c)
+
     return fig
 
 
