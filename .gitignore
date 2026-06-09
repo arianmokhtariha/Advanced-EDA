@@ -10,3 +10,5 @@ __pycache__/
 
 PROMPT.md
 PROMPT.xml
+
+.vscode

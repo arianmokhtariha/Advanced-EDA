@@ -271,7 +271,7 @@ def distribution_plot(
 
 
 
-def outlier_plot(
+def box_plot(
     df: pd.DataFrame,
     ignore_list: Optional[List[str]] = None,
     whis: float = 1.5,
