@@ -454,3 +454,433 @@ def box_plot(
 
     return fig
 
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from typing import Optional, List
+import scipy.stats as stats
+
+
+PALETTE = [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
+    "#FFA15A", "#19D3F3", "#FF6692",
+]
+
+_DARK_BG   = "#0e1117"
+_PLOT_BG   = "#1a1a1a"
+_GRID_CLR  = "rgba(128,128,128,0.2)"
+_FONT_CLR  = "white"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. cross_tab_heatmap
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cross_tab_heatmap(
+    df: pd.DataFrame,
+    col1: str,
+    col2: str,
+    ignore_cols: list = [],
+    normalize: bool = True,
+    title: str = "",
+) -> go.Figure:
+    """
+    Crosstab heatmap: does the distribution of col2 shift across levels of col1?
+
+    Each row is one category of col1.  When normalize=True the values are row
+    percentages (each row sums to 100 %) so the colour encodes composition
+    rather than raw counts — useful when categories have very different sizes.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    col1 : str
+        Row dimension (y-axis).
+    col2 : str
+        Column dimension (x-axis).
+    ignore_cols : list
+        Columns to skip — not used in the crosstab itself but kept for API
+        consistency with the rest of the library.
+    normalize : bool, default True
+        Row-normalise the crosstab to percentages.
+    title : str
+        Figure title.  Defaults to "col1 × col2".
+
+    Returns
+    -------
+    go.Figure
+    """
+    working = df.drop(columns=[c for c in ignore_cols if c in df.columns])
+
+    ct = pd.crosstab(working[col1], working[col2])
+
+    if normalize:
+        z      = ct.div(ct.sum(axis=1), axis=0) * 100
+        fmt    = ".1f"
+        cbar_title = "Row %"
+    else:
+        z      = ct.astype(float)
+        fmt    = ".0f"
+        cbar_title = "Count"
+
+    y_labels = [str(v) for v in z.index.tolist()]
+    x_labels = [str(v) for v in z.columns.tolist()]
+    z_vals   = z.values
+
+    # Build annotation text matrix
+    text_matrix = [
+        [f"{z_vals[r, c]:{fmt}}" + ("%" if normalize else "")
+         for c in range(len(x_labels))]
+        for r in range(len(y_labels))
+    ]
+
+    fig = go.Figure(go.Heatmap(
+        z=z_vals,
+        x=x_labels,
+        y=y_labels,
+        text=text_matrix,
+        texttemplate="%{text}",
+        textfont=dict(size=11, color="white", family="Arial"),
+        colorscale="Viridis",
+        colorbar=dict(
+            title=dict(text=cbar_title, font=dict(size=12, color=_FONT_CLR, family="Arial")),
+            tickfont=dict(color=_FONT_CLR, family="Arial"),
+            thickness=14,
+            outlinewidth=0,
+        ),
+        hovertemplate=(
+            f"<b>{col1}</b>: %{{y}}<br>"
+            f"<b>{col2}</b>: %{{x}}<br>"
+            f"<b>{'Row %' if normalize else 'Count'}</b>: %{{z:{fmt}}}"
+            + ("%" if normalize else "") + "<extra></extra>"
+        ),
+    ))
+
+    plot_title = title if title else f"{col1}  ×  {col2}"
+    subtitle   = "Row-normalised (each row sums to 100 %)" if normalize else "Raw counts"
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{plot_title}</b><br><sup>{subtitle}</sup>",
+            font=dict(size=18, color=_FONT_CLR, family="Arial"),
+            x=0.5, xanchor="center",
+        ),
+        template="plotly_dark",
+        width=1400,
+        height=max(420, len(y_labels) * 52 + 160),
+        paper_bgcolor=_DARK_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=dict(color=_FONT_CLR, family="Arial"),
+        xaxis=dict(
+            title=dict(text=col2, font=dict(size=13)),
+            tickfont=dict(size=11),
+            side="bottom",
+        ),
+        yaxis=dict(
+            title=dict(text=col1, font=dict(size=13)),
+            tickfont=dict(size=11),
+            autorange="reversed",   # top-to-bottom reading order
+        ),
+        margin=dict(l=140, r=80, t=100, b=100),
+    )
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. correlation_heatmap
+# ─────────────────────────────────────────────────────────────────────────────
+
+def correlation_heatmap(
+    df: pd.DataFrame,
+    ignore_cols: list = [],
+    cols: Optional[List[str]] = None,
+    method: str = "pearson",
+    threshold: float = 0.0,
+    title: str = "",
+) -> go.Figure:
+    """
+    Annotated correlation heatmap — primary tool for Feature Correlation section.
+
+    Diagonal and cells whose |r| < threshold are masked (shown as empty) so
+    the chart stays readable even with many columns.  Colour diverges around 0:
+    deep blue = strong positive, deep red = strong negative, grey ≈ zero.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    ignore_cols : list
+        Columns to exclude.
+    cols : list of str, optional
+        Restrict to these numerical columns.  If None, uses all numeric cols
+        minus ignore_cols.
+    method : {'pearson', 'spearman', 'kendall'}, default 'pearson'
+    threshold : float, default 0.0
+        Cells with |r| below this value are blanked out.
+    title : str
+
+    Returns
+    -------
+    go.Figure
+    """
+    working = df.drop(columns=[c for c in ignore_cols if c in df.columns])
+
+    if cols is not None:
+        working = working[cols]
+
+    num = working.select_dtypes(include=[np.number])
+    if num.shape[1] < 2:
+        raise ValueError("Need at least two numerical columns for a correlation heatmap.")
+
+    corr = num.corr(method=method)
+    labels = corr.columns.tolist()
+    n = len(labels)
+    z = corr.values.copy()
+
+    # --- Build masked versions for display & annotation ---
+    z_display = z.copy().astype(float)
+    text_matrix = []
+
+    for r in range(n):
+        row_text = []
+        for c in range(n):
+            if r == c:
+                # blank out diagonal
+                z_display[r, c] = np.nan
+                row_text.append("")
+            elif abs(z[r, c]) < threshold:
+                z_display[r, c] = np.nan
+                row_text.append("")
+            else:
+                row_text.append(f"{z[r, c]:.2f}")
+        text_matrix.append(row_text)
+
+    # Diverging RdBu — reversed so blue=positive, red=negative (conventional)
+    colorscale = [
+        [0.0,  "#B2182B"],
+        [0.1,  "#D6604D"],
+        [0.2,  "#F4A582"],
+        [0.35, "#FDDBC7"],
+        [0.5,  "#F7F7F7"],
+        [0.65, "#D1E5F0"],
+        [0.8,  "#92C5DE"],
+        [0.9,  "#4393C3"],
+        [1.0,  "#2166AC"],
+    ]
+
+    fig = go.Figure(go.Heatmap(
+        z=z_display,
+        x=labels,
+        y=labels,
+        text=text_matrix,
+        texttemplate="%{text}",
+        textfont=dict(size=10, color="white", family="Arial"),
+        colorscale=colorscale,
+        zmid=0,
+        zmin=-1,
+        zmax=1,
+        colorbar=dict(
+            title=dict(text=method.capitalize(), font=dict(size=12, color=_FONT_CLR, family="Arial")),
+            tickfont=dict(color=_FONT_CLR, family="Arial"),
+            tickvals=[-1, -0.5, 0, 0.5, 1],
+            ticktext=["-1", "-0.5", "0", "0.5", "1"],
+            thickness=14,
+            outlinewidth=0,
+        ),
+        hovertemplate="<b>%{y}</b> × <b>%{x}</b><br>r = %{z:.3f}<extra></extra>",
+    ))
+
+    # --- Threshold note ---
+    thr_note = f"  |r| < {threshold} masked" if threshold > 0 else ""
+    method_note = f"{method.capitalize()} correlation{thr_note}"
+    plot_title  = title if title else "Feature Correlation Matrix"
+
+    cell_px = max(38, min(70, 900 // n))
+    size    = n * cell_px + 200
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{plot_title}</b><br><sup>{method_note}</sup>",
+            font=dict(size=18, color=_FONT_CLR, family="Arial"),
+            x=0.5, xanchor="center",
+        ),
+        template="plotly_dark",
+        width=max(700, size),
+        height=max(600, size),
+        paper_bgcolor=_DARK_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=dict(color=_FONT_CLR, family="Arial"),
+        xaxis=dict(
+            tickfont=dict(size=11),
+            tickangle=-40,
+            side="bottom",
+        ),
+        yaxis=dict(
+            tickfont=dict(size=11),
+            autorange="reversed",
+        ),
+        margin=dict(l=150, r=80, t=110, b=150),
+    )
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. scatter_plot
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scatter_plot(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    ignore_cols: list = [],
+    color_by: Optional[str] = None,
+    trendline: bool = True,
+    title: str = "",
+    width: int = 1400,
+) -> go.Figure:
+    """
+    Scatter plot with an optional OLS trendline.
+
+    When color_by is supplied the points are split by category and each group
+    gets its own colour from the library palette.  A trendline is fitted per
+    group (not a global pooled line), which makes it easy to spot whether the
+    x–y relationship holds equally across all categories or diverges.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    x : str
+        Numerical column for the x-axis.
+    y : str
+        Numerical column for the y-axis.
+    ignore_cols : list
+        Columns to skip (API consistency).
+    color_by : str, optional
+        Categorical column to colour-split the scatter.
+    trendline : bool, default True
+        Overlay an OLS trendline.  One line per group when color_by is set.
+    title : str
+
+    Returns
+    -------
+    go.Figure
+    """
+    working = df.drop(columns=[c for c in ignore_cols if c in df.columns])
+    working = working[[col for col in [x, y, color_by] if col]].dropna()
+
+    plot_title = title if title else f"{y}  vs  {x}"
+
+    fig = go.Figure()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _add_trendline(xd, yd, color, name_prefix=""):
+        """Fit OLS and add a smooth line trace. Annotate with r²."""
+        if len(xd) < 3:
+            return
+        slope, intercept, r_val, p_val, _ = stats.linregress(xd, yd)
+        x_sorted = np.linspace(xd.min(), xd.max(), 200)
+        y_hat    = slope * x_sorted + intercept
+        label    = f"{name_prefix} trend (r²={r_val**2:.2f})" if name_prefix else f"OLS (r²={r_val**2:.2f})"
+        fig.add_trace(go.Scatter(
+            x=x_sorted,
+            y=y_hat,
+            mode="lines",
+            name=label,
+            line=dict(color=color, width=2, dash="dash"),
+            opacity=0.8,
+            showlegend=True,
+            hoverinfo="skip",
+        ))
+
+    # ── No colour split ───────────────────────────────────────────────────────
+    if color_by is None:
+        xd = working[x].values
+        yd = working[y].values
+
+        fig.add_trace(go.Scatter(
+            x=xd, y=yd,
+            mode="markers",
+            name="",
+            marker=dict(
+                color=PALETTE[0],
+                size=6,
+                opacity=0.65,
+                line=dict(width=0.4, color="rgba(255,255,255,0.3)"),
+            ),
+            showlegend=False,
+            hovertemplate=f"<b>{x}</b>: %{{x}}<br><b>{y}</b>: %{{y}}<extra></extra>",
+        ))
+
+        if trendline:
+            _add_trendline(xd, yd, color=PALETTE[2])
+
+    # ── Colour split ──────────────────────────────────────────────────────────
+    else:
+        categories = sorted(working[color_by].unique())
+        for i, cat in enumerate(categories):
+            mask = working[color_by] == cat
+            sub  = working[mask]
+            col  = PALETTE[i % len(PALETTE)]
+
+            fig.add_trace(go.Scatter(
+                x=sub[x].values,
+                y=sub[y].values,
+                mode="markers",
+                name=str(cat),
+                marker=dict(
+                    color=col,
+                    size=6,
+                    opacity=0.65,
+                    line=dict(width=0.4, color="rgba(255,255,255,0.3)"),
+                ),
+                legendgroup=str(cat),
+                hovertemplate=(
+                    f"<b>{color_by}</b>: {cat}<br>"
+                    f"<b>{x}</b>: %{{x}}<br>"
+                    f"<b>{y}</b>: %{{y}}<extra></extra>"
+                ),
+            ))
+
+            if trendline:
+                _add_trendline(sub[x].values, sub[y].values, color=col, name_prefix=str(cat))
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{plot_title}</b>",
+            font=dict(size=18, color=_FONT_CLR, family="Arial"),
+            x=0.5, xanchor="center",
+        ),
+        template="plotly_dark",
+        width=width,
+        height=620,
+        paper_bgcolor=_DARK_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=dict(color=_FONT_CLR, family="Arial"),
+        xaxis=dict(
+            title=dict(text=x, font=dict(size=13, family="Arial")),
+            tickfont=dict(size=11),
+            showgrid=True,
+            gridwidth=0.5,
+            gridcolor=_GRID_CLR,
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=dict(text=y, font=dict(size=13, family="Arial")),
+            tickfont=dict(size=11),
+            showgrid=True,
+            gridwidth=0.5,
+            gridcolor=_GRID_CLR,
+            zeroline=False,
+        ),
+        legend=dict(
+            bgcolor="rgba(0,0,0,0.4)",
+            bordercolor="rgba(255,255,255,0.15)",
+            borderwidth=1,
+            font=dict(size=11, color=_FONT_CLR),
+        ),
+        margin=dict(l=80, r=60, t=90, b=80),
+    )
+
+    return fig
