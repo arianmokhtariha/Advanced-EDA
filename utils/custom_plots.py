@@ -871,12 +871,12 @@ PALETTE = [
     "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
     "#FFA15A", "#19D3F3", "#FF6692",
 ]
-
+ 
 _DARK_BG  = "#0e1117"
 _PLOT_BG  = "#1a1a1a"
 _GRID_CLR = "rgba(128,128,128,0.2)"
 _FONT_CLR = "white"
-
+ 
 _RDBU = [
     [0.0,  "#B2182B"],
     [0.1,  "#D6604D"],
@@ -888,16 +888,35 @@ _RDBU = [
     [0.9,  "#4393C3"],
     [1.0,  "#2166AC"],
 ]
-
-
+ 
+ 
+def _is_categorical_col(s: pd.Series) -> bool:
+    """True for string/object/category dtypes, including PyArrow-backed variants."""
+    if pd.api.types.is_categorical_dtype(s):
+        return True
+    if pd.api.types.is_string_dtype(s):
+        return True
+    # catches ArrowDtype('large_string'), ArrowDtype('string'), etc.
+    dtype_str = str(s.dtype).lower()
+    if "string" in dtype_str or "object" in dtype_str:
+        return True
+    return False
+ 
+ 
 def _normalize_size(s: pd.Series, lo: float = 5, hi: float = 50) -> np.ndarray:
-    """Min-max scale a Series to [lo, hi]."""
-    mn, mx = s.min(), s.max()
+    """Min-max scale a numeric Series to [lo, hi]. Raises clearly if non-numeric."""
+    if _is_categorical_col(s):
+        raise TypeError(
+            f"Column '{s.name}' is not numeric and cannot be used as bubble size. "
+            "The `size` parameter must be a numerical column."
+        )
+    vals = s.to_numpy(dtype=float, na_value=np.nan)
+    mn, mx = np.nanmin(vals), np.nanmax(vals)
     if mx == mn:
-        return np.full(len(s), (lo + hi) / 2)
-    return lo + (s.values - mn) / (mx - mn) * (hi - lo)
-
-
+        return np.full(len(vals), (lo + hi) / 2)
+    return lo + (vals - mn) / (mx - mn) * (hi - lo)
+ 
+ 
 def bubble_plot(
     df: pd.DataFrame,
     x: str,
@@ -911,12 +930,12 @@ def bubble_plot(
 ) -> go.Figure:
     """
     Three-variable bubble chart: x position × y position × bubble area.
-
+ 
     Bubble area encodes the `size` column (normalised to [5, 50] px so
     extreme values don't eat the chart).  `color_by` accepts either a
     categorical column (discrete palette + legend) or a numerical column
     (RdBu colorbar).
-
+ 
     Parameters
     ----------
     df : pd.DataFrame
@@ -937,7 +956,7 @@ def bubble_plot(
     opacity : float, default 0.7
         Marker opacity.
     width : int, default 1400
-
+ 
     Returns
     -------
     go.Figure
@@ -946,37 +965,27 @@ def bubble_plot(
     required = [c for c in [x, y, size, color_by] if c]
     working  = df.drop(columns=[c for c in ignore_cols if c in df.columns])
     working  = working[required].dropna()
-
+ 
     if working.empty:
         raise ValueError("No rows remain after dropping nulls for the selected columns.")
-
+ 
     bubble_sizes = _normalize_size(working[size])
     plot_title   = title if title else f"{y}  vs  {x}  (size = {size})"
-
-    # ── Detect color_by type ──────────────────────────────────────────────────
-    is_categorical = (
-        color_by is not None
-        and (
-            working[color_by].dtype == object
-            or str(working[color_by].dtype) == "category"
-            or working[color_by].nunique() <= 12  # low-cardinality numerics treated as categorical
-        )
+ 
+    # Size reference values for the annotation — computed after we know size is numeric
+    raw  = working[size].to_numpy(dtype=float, na_value=np.nan)
+    refs = [float(np.nanquantile(raw, p)) for p in (0.25, 0.75, 1.0)]
+    # Use helper so PyArrow-backed string dtypes (large_string, string) are caught
+    # alongside plain object and pandas category.  Low-cardinality numerics (≤12
+    # unique values) are also treated as categorical.
+    is_categorical = color_by is not None and (
+        _is_categorical_col(working[color_by])
+        or working[color_by].nunique() <= 12
     )
     is_numerical = color_by is not None and not is_categorical
-
+ 
     fig = go.Figure()
-
-    # ── Size legend annotation ─────────────────────────────────────────────────
-    # We'll add representative bubble sizes as a manual annotation block
-    # rather than polluting the trace legend.
-    raw   = working[size]
-    pcts  = [0.25, 0.75, 1.0]            # represent small / medium / large
-    refs  = [raw.quantile(p) for p in pcts]
-    ref_sizes = [
-        float(_normalize_size(pd.Series([v] + [raw.min(), raw.max()]), 5, 50)[0])
-        for v in refs
-    ]
-
+ 
     # ── Case A: categorical color_by ─────────────────────────────────────────
     if is_categorical:
         categories = sorted(working[color_by].unique(), key=str)
@@ -985,7 +994,7 @@ def bubble_plot(
             sub  = working[mask]
             col  = PALETTE[i % len(PALETTE)]
             sub_sizes = bubble_sizes[mask.values]
-
+ 
             hover = (
                 f"<b>{color_by}</b>: {cat}<br>"
                 f"<b>{x}</b>: %{{x}}<br>"
@@ -1007,7 +1016,7 @@ def bubble_plot(
                 legendgroup=str(cat),
                 hovertemplate=hover,
             ))
-
+ 
     # ── Case B: numerical color_by ────────────────────────────────────────────
     elif is_numerical:
         hover = (
@@ -1042,7 +1051,7 @@ def bubble_plot(
             showlegend=False,
             hovertemplate=hover,
         ))
-
+ 
     # ── Case C: no color_by ───────────────────────────────────────────────────
     else:
         hover = (
@@ -1065,7 +1074,7 @@ def bubble_plot(
             showlegend=False,
             hovertemplate=hover,
         ))
-
+ 
     # ── Size reference annotation (top-right, inside plot) ───────────────────
     # Three ghost bubbles with labels: Q25 / Q75 / Max of the size column.
     # Rendered as separate traces with no axis influence (visible in legend area).
@@ -1078,7 +1087,7 @@ def bubble_plot(
         f"<b>Bubble size → {size}</b><br>"
         + "<br>".join(size_note_lines)
     )
-
+ 
     annotations = [dict(
         text=size_block,
         xref="paper", yref="paper",
@@ -1092,7 +1101,7 @@ def bubble_plot(
         borderpad=6,
         align="left",
     )]
-
+ 
     # ── Layout ────────────────────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
@@ -1135,5 +1144,5 @@ def bubble_plot(
         annotations=annotations,
         margin=dict(l=80, r=80, t=90, b=80),
     )
-
+ 
     return fig
