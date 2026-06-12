@@ -3,9 +3,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Literal, Callable
+from typing import Optional, List, Literal
 import math
-import networkx as nx
+import scipy.stats as stats
 
 
 def distribution_plot(
@@ -454,13 +454,6 @@ def box_plot(
 
     return fig
 
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from typing import Optional, List
-import scipy.stats as stats
-
 
 PALETTE = [
     "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
@@ -472,10 +465,6 @@ _PLOT_BG   = "#1a1a1a"
 _GRID_CLR  = "rgba(128,128,128,0.2)"
 _FONT_CLR  = "white"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. cross_tab_heatmap
-# ─────────────────────────────────────────────────────────────────────────────
 
 def cross_tab_heatmap(
     df: pd.DataFrame,
@@ -588,15 +577,11 @@ def cross_tab_heatmap(
     return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. correlation_heatmap
-# ─────────────────────────────────────────────────────────────────────────────
-
 def correlation_heatmap(
     df: pd.DataFrame,
     ignore_cols: list = [],
     cols: Optional[List[str]] = None,
-    method: str = "pearson",
+    method: Literal['pearson', 'spearman', 'kendall'] = 'pearson',
     threshold: float = 0.0,
     title: str = "",
 ) -> go.Figure:
@@ -725,10 +710,6 @@ def correlation_heatmap(
 
     return fig
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. scatter_plot
-# ─────────────────────────────────────────────────────────────────────────────
 
 def scatter_plot(
     df: pd.DataFrame,
@@ -881,6 +862,278 @@ def scatter_plot(
             font=dict(size=11, color=_FONT_CLR),
         ),
         margin=dict(l=80, r=60, t=90, b=80),
+    )
+
+    return fig
+
+
+PALETTE = [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
+    "#FFA15A", "#19D3F3", "#FF6692",
+]
+
+_DARK_BG  = "#0e1117"
+_PLOT_BG  = "#1a1a1a"
+_GRID_CLR = "rgba(128,128,128,0.2)"
+_FONT_CLR = "white"
+
+_RDBU = [
+    [0.0,  "#B2182B"],
+    [0.1,  "#D6604D"],
+    [0.2,  "#F4A582"],
+    [0.35, "#FDDBC7"],
+    [0.5,  "#F7F7F7"],
+    [0.65, "#D1E5F0"],
+    [0.8,  "#92C5DE"],
+    [0.9,  "#4393C3"],
+    [1.0,  "#2166AC"],
+]
+
+
+def _normalize_size(s: pd.Series, lo: float = 5, hi: float = 50) -> np.ndarray:
+    """Min-max scale a Series to [lo, hi]."""
+    mn, mx = s.min(), s.max()
+    if mx == mn:
+        return np.full(len(s), (lo + hi) / 2)
+    return lo + (s.values - mn) / (mx - mn) * (hi - lo)
+
+
+def bubble_plot(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    size: str,
+    ignore_cols: list = [],
+    color_by: Optional[str] = None,
+    title: str = "",
+    opacity: float = 0.7,
+    width: int = 1400,
+) -> go.Figure:
+    """
+    Three-variable bubble chart: x position × y position × bubble area.
+
+    Bubble area encodes the `size` column (normalised to [5, 50] px so
+    extreme values don't eat the chart).  `color_by` accepts either a
+    categorical column (discrete palette + legend) or a numerical column
+    (RdBu colorbar).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    x : str
+        Numerical column for the horizontal axis.
+    y : str
+        Numerical column for the vertical axis.
+    size : str
+        Numerical column controlling bubble area.
+    ignore_cols : list
+        Columns to exclude (API consistency).
+    color_by : str, optional
+        Categorical → discrete palette with legend.
+        Numerical  → continuous RdBu colorbar.
+        None       → all bubbles in "#00CC96".
+    title : str
+        Figure title.  Defaults to "y  vs  x  (size = size)".
+    opacity : float, default 0.7
+        Marker opacity.
+    width : int, default 1400
+
+    Returns
+    -------
+    go.Figure
+    """
+    # ── Prep ──────────────────────────────────────────────────────────────────
+    required = [c for c in [x, y, size, color_by] if c]
+    working  = df.drop(columns=[c for c in ignore_cols if c in df.columns])
+    working  = working[required].dropna()
+
+    if working.empty:
+        raise ValueError("No rows remain after dropping nulls for the selected columns.")
+
+    bubble_sizes = _normalize_size(working[size])
+    plot_title   = title if title else f"{y}  vs  {x}  (size = {size})"
+
+    # ── Detect color_by type ──────────────────────────────────────────────────
+    is_categorical = (
+        color_by is not None
+        and (
+            working[color_by].dtype == object
+            or str(working[color_by].dtype) == "category"
+            or working[color_by].nunique() <= 12  # low-cardinality numerics treated as categorical
+        )
+    )
+    is_numerical = color_by is not None and not is_categorical
+
+    fig = go.Figure()
+
+    # ── Size legend annotation ─────────────────────────────────────────────────
+    # We'll add representative bubble sizes as a manual annotation block
+    # rather than polluting the trace legend.
+    raw   = working[size]
+    pcts  = [0.25, 0.75, 1.0]            # represent small / medium / large
+    refs  = [raw.quantile(p) for p in pcts]
+    ref_sizes = [
+        float(_normalize_size(pd.Series([v] + [raw.min(), raw.max()]), 5, 50)[0])
+        for v in refs
+    ]
+
+    # ── Case A: categorical color_by ─────────────────────────────────────────
+    if is_categorical:
+        categories = sorted(working[color_by].unique(), key=str)
+        for i, cat in enumerate(categories):
+            mask = working[color_by] == cat
+            sub  = working[mask]
+            col  = PALETTE[i % len(PALETTE)]
+            sub_sizes = bubble_sizes[mask.values]
+
+            hover = (
+                f"<b>{color_by}</b>: {cat}<br>"
+                f"<b>{x}</b>: %{{x}}<br>"
+                f"<b>{y}</b>: %{{y}}<br>"
+                f"<b>{size}</b>: %{{customdata:.3g}}<extra></extra>"
+            )
+            fig.add_trace(go.Scatter(
+                x=sub[x].values,
+                y=sub[y].values,
+                mode="markers",
+                name=str(cat),
+                customdata=sub[size].values,
+                marker=dict(
+                    size=sub_sizes,
+                    color=col,
+                    opacity=opacity,
+                    line=dict(width=0.8, color="rgba(255,255,255,0.25)"),
+                ),
+                legendgroup=str(cat),
+                hovertemplate=hover,
+            ))
+
+    # ── Case B: numerical color_by ────────────────────────────────────────────
+    elif is_numerical:
+        hover = (
+            f"<b>{x}</b>: %{{x}}<br>"
+            f"<b>{y}</b>: %{{y}}<br>"
+            f"<b>{size}</b>: %{{customdata[0]:.3g}}<br>"
+            f"<b>{color_by}</b>: %{{customdata[1]:.3g}}<extra></extra>"
+        )
+        fig.add_trace(go.Scatter(
+            x=working[x].values,
+            y=working[y].values,
+            mode="markers",
+            name="",
+            customdata=np.stack([working[size].values, working[color_by].values], axis=1),
+            marker=dict(
+                size=bubble_sizes,
+                color=working[color_by].values,
+                colorscale=_RDBU,
+                colorbar=dict(
+                    title=dict(
+                        text=color_by,
+                        font=dict(size=12, color=_FONT_CLR, family="Arial"),
+                    ),
+                    tickfont=dict(color=_FONT_CLR, family="Arial"),
+                    thickness=14,
+                    outlinewidth=0,
+                ),
+                opacity=opacity,
+                line=dict(width=0.8, color="rgba(255,255,255,0.25)"),
+                showscale=True,
+            ),
+            showlegend=False,
+            hovertemplate=hover,
+        ))
+
+    # ── Case C: no color_by ───────────────────────────────────────────────────
+    else:
+        hover = (
+            f"<b>{x}</b>: %{{x}}<br>"
+            f"<b>{y}</b>: %{{y}}<br>"
+            f"<b>{size}</b>: %{{customdata:.3g}}<extra></extra>"
+        )
+        fig.add_trace(go.Scatter(
+            x=working[x].values,
+            y=working[y].values,
+            mode="markers",
+            name="",
+            customdata=working[size].values,
+            marker=dict(
+                size=bubble_sizes,
+                color="#00CC96",
+                opacity=opacity,
+                line=dict(width=0.8, color="rgba(255,255,255,0.25)"),
+            ),
+            showlegend=False,
+            hovertemplate=hover,
+        ))
+
+    # ── Size reference annotation (top-right, inside plot) ───────────────────
+    # Three ghost bubbles with labels: Q25 / Q75 / Max of the size column.
+    # Rendered as separate traces with no axis influence (visible in legend area).
+    size_labels = ["Q25", "Q75", "Max"]
+    size_note_lines = [
+        f"● {size_labels[i]}  {refs[i]:.3g}"
+        for i in range(3)
+    ]
+    size_block = (
+        f"<b>Bubble size → {size}</b><br>"
+        + "<br>".join(size_note_lines)
+    )
+
+    annotations = [dict(
+        text=size_block,
+        xref="paper", yref="paper",
+        x=0.99, y=0.99,
+        xanchor="right", yanchor="top",
+        showarrow=False,
+        font=dict(size=11, color="#AAAAAA", family="Arial"),
+        bgcolor="rgba(0,0,0,0.45)",
+        bordercolor="rgba(255,255,255,0.12)",
+        borderwidth=1,
+        borderpad=6,
+        align="left",
+    )]
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{plot_title}</b>",
+            font=dict(size=18, color=_FONT_CLR, family="Arial"),
+            x=0.5, xanchor="center",
+        ),
+        template="plotly_dark",
+        width=width,
+        height=640,
+        paper_bgcolor=_DARK_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=dict(color=_FONT_CLR, family="Arial"),
+        xaxis=dict(
+            title=dict(text=x, font=dict(size=13, family="Arial")),
+            tickfont=dict(size=11),
+            showgrid=True,
+            gridwidth=0.5,
+            gridcolor=_GRID_CLR,
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=dict(text=y, font=dict(size=13, family="Arial")),
+            tickfont=dict(size=11),
+            showgrid=True,
+            gridwidth=0.5,
+            gridcolor=_GRID_CLR,
+            zeroline=False,
+        ),
+        legend=dict(
+            bgcolor="rgba(0,0,0,0.4)",
+            bordercolor="rgba(255,255,255,0.12)",
+            borderwidth=1,
+            font=dict(size=11, color=_FONT_CLR),
+            title=dict(
+                text=color_by if is_categorical else "",
+                font=dict(size=12, color=_FONT_CLR),
+            ),
+        ),
+        annotations=annotations,
+        margin=dict(l=80, r=80, t=90, b=80),
     )
 
     return fig
