@@ -12,3 +12,6 @@ PROMPT.md
 PROMPT.xml
 
 .vscode
+
+.claude/
+CLAUDE.md
