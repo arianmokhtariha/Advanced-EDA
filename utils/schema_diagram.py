@@ -332,8 +332,12 @@ def schema_diagram(
     _x_range = (max(_all_xs) - min(_all_xs)) or 1.0
     _y_range = (max(_all_ys) - min(_all_ys)) or 1.0
 
-    # ── 4. Edge lines (perimeter-to-perimeter) ────────────────────────────────
+    # ── 4. Edge lines + arrowhead stubs (perimeter-to-perimeter) ──────────────
+    # Single pass per edge: build the line segments and the arrowhead annotation
+    # (covering only the last 20 % of the edge so the head sits at the node
+    # perimeter, not inside it).
     edge_x, edge_y = [], []
+    annotations = []
     for u, v in G.edges():
         x0, y0 = pos[u]
         x1, y1 = pos[v]
@@ -341,28 +345,10 @@ def schema_diagram(
         tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)
         edge_x += [sx, tx, None]
         edge_y += [sy, ty, None]
-
-    edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        mode="lines",
-        line=dict(width=edge_width, color=edge_color),
-        hoverinfo="none",
-    )
-
-    # ── 5. Arrowhead stubs ────────────────────────────────────────────────────
-    # Short annotation covering only the last 20 % of each edge so the
-    # arrowhead sits cleanly at the node perimeter, not inside the node.
-    annotations = []
-    for u, v in G.edges():
-        x0, y0 = pos[u]
-        x1, y1 = pos[v]
-        sx, sy = _perimeter_point(x1, y1, x0, y0, node_r)
-        tx, ty = _perimeter_point(x0, y0, x1, y1, node_r)
-        stub_ax = sx + (tx - sx) * 0.80
-        stub_ay = sy + (ty - sy) * 0.80
         annotations.append(dict(
             x=tx, y=ty,
-            ax=stub_ax, ay=stub_ay,
+            ax=sx + (tx - sx) * 0.80,
+            ay=sy + (ty - sy) * 0.80,
             xref="x", yref="y",
             axref="x", ayref="y",
             showarrow=True,
@@ -374,7 +360,14 @@ def schema_diagram(
             opacity=0.9,
         ))
 
-    # ── 6. Edge labels ────────────────────────────────────────────────────────
+    edge_trace = go.Scatter(
+        x=edge_x, y=edge_y,
+        mode="lines",
+        line=dict(width=edge_width, color=edge_color),
+        hoverinfo="none",
+    )
+
+    # ── 5. Edge labels ────────────────────────────────────────────────────────
     # Placed at 35 % from source + perpendicular nudge to separate labels on
     # edges that converge on the same hub node.
     lbl_x, lbl_y, lbl_angles, hover_texts, always_texts = [], [], [], [], []
@@ -482,7 +475,7 @@ def schema_diagram(
             hoverinfo="none",
         )
 
-    # ── 7. Node trace ─────────────────────────────────────────────────────────
+    # ── 6. Node trace ─────────────────────────────────────────────────────────
     node_names  = list(G.nodes())
     node_x      = [pos[n][0] for n in node_names]
     node_y      = [pos[n][1] for n in node_names]
@@ -523,7 +516,7 @@ def schema_diagram(
         ),
     )
 
-    # ── 8. Assemble figure ────────────────────────────────────────────────────
+    # ── 7. Assemble figure ────────────────────────────────────────────────────
     fig = go.Figure(
         data=[edge_trace, label_trace, node_trace],
         layout=go.Layout(

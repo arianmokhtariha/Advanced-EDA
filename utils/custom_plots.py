@@ -8,6 +8,42 @@ import math
 import scipy.stats as stats
 
 
+# ── Shared aesthetic constants ───────────────────────────────────────────────
+PALETTE = [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
+    "#FFA15A", "#19D3F3", "#FF6692",
+]
+# 10-colour qualitative palette shared by distribution_plot and box_plot
+_NUMERICAL_COLORS = [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
+    "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
+]
+_CATEGORICAL_COLORS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+]
+_OTHER_COLOR = "#4a4a4a"
+
+_DARK_BG = "#0e1117"
+_PLOT_BG = "#1a1a1a"
+_GRID_CLR = "rgba(128,128,128,0.2)"
+_FONT_CLR = "white"
+
+# Diverging RdBu (blue = positive, red = negative) for correlation & bubble colour
+_RDBU = [
+    [0.0,  "#B2182B"],
+    [0.1,  "#D6604D"],
+    [0.2,  "#F4A582"],
+    [0.35, "#FDDBC7"],
+    [0.5,  "#F7F7F7"],
+    [0.65, "#D1E5F0"],
+    [0.8,  "#92C5DE"],
+    [0.9,  "#4393C3"],
+    [1.0,  "#2166AC"],
+]
+
+
 def distribution_plot(
     df: pd.DataFrame,
     title: str = 'Distribution Overview',
@@ -48,18 +84,6 @@ def distribution_plot(
     plotly.graph_objects.Figure
     """
 
-    # ── Colour palettes ────────────────────────────────────────────────────────
-    NUMERICAL_COLORS = [
-        '#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-        '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52',
-    ]
-    CATEGORICAL_COLORS = [
-        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-        '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-        '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
-    ]
-    OTHER_COLOR = '#4a4a4a'
-
     # ── Column selection ───────────────────────────────────────────────────────
     ignore_cols = ignore_cols or []
     cols_to_plot = [
@@ -71,14 +95,12 @@ def distribution_plot(
         raise ValueError("No valid columns to plot after filtering.")
 
     # ── Column type classification ─────────────────────────────────────────────
+    # Only numeric columns with enough distinct values are 'numerical'; datetime,
+    # object/category, and low-cardinality numerics all read as 'categorical'.
     def _classify(col: str) -> str:
         s = df[col].dropna()
-        if pd.api.types.is_datetime64_any_dtype(s):
-            return 'categorical'
-        if pd.api.types.is_categorical_dtype(s) or pd.api.types.is_object_dtype(s):
-            return 'categorical'
-        if pd.api.types.is_numeric_dtype(s):
-            return 'categorical' if s.nunique() < categorical_threshold else 'numerical'
+        if pd.api.types.is_numeric_dtype(s) and s.nunique() >= categorical_threshold:
+            return 'numerical'
         return 'categorical'
 
     column_types = {col: _classify(col) for col in cols_to_plot}
@@ -128,7 +150,7 @@ def distribution_plot(
                 go.Histogram(
                     x=col_data,
                     name=col,
-                    marker_color=NUMERICAL_COLORS[idx % len(NUMERICAL_COLORS)],
+                    marker_color=_NUMERICAL_COLORS[idx % len(_NUMERICAL_COLORS)],
                     showlegend=False,
                     autobinx=True,
                 ),
@@ -183,14 +205,14 @@ def distribution_plot(
                 categories = [*top.index,  'Other']
                 counts     = [*top.values, rest]
                 colors     = [
-                    CATEGORICAL_COLORS[i % len(CATEGORICAL_COLORS)]
+                    _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)]
                     for i in range(top_n_categories)
-                ] + [OTHER_COLOR]
+                ] + [_OTHER_COLOR]
             else:
                 categories = list(value_counts.index)
                 counts     = list(value_counts.values)
                 colors     = [
-                    CATEGORICAL_COLORS[i % len(CATEGORICAL_COLORS)]
+                    _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)]
                     for i in range(len(categories))
                 ]
 
@@ -203,10 +225,7 @@ def distribution_plot(
             pcts       = [pcts[i]       for i in order]
             colors     = [colors[i]     for i in order]
 
-            # ── FIX: give the tallest bar enough room so its outside label
-            #    is never clipped.  1.25× headroom (vs the old 1.15×) combined
-            #    with disabling uniformtext_mode='hide' (see layout below)
-            #    guarantees the label always renders.
+            # 1.25x headroom so the tallest bar's outside % label never clips
             categorical_ymax[(row, col_pos)] = max(counts) * 1.25
 
             fig.add_trace(
@@ -242,9 +261,7 @@ def distribution_plot(
         plot_bgcolor='#0e1117',
         paper_bgcolor='#0e1117',
         font=dict(color='#fafafa', size=12),
-        # ── FIX: 'hide' was silently suppressing the label on the tallest bar
-        #    because Plotly couldn't fit it at the uniform minimum size within
-        #    the (too-tight) headroom.  'show' forces all labels to render.
+        # 'show' (not 'hide') forces every bar label to render
         uniformtext_minsize=8,
         uniformtext_mode='show',
         annotations=list(fig.layout.annotations) + stats_annotations,
@@ -314,12 +331,9 @@ def box_plot(
         raise ValueError("No numerical columns found after applying ignore_list")
 
     n = len(numerical_cols)
-    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-              '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52']
 
     # ── Layout dimensions ─────────────────────────────────────────────────────
     n_rows = int(np.ceil(n / n_cols))
-    cols_n = n_cols
 
     # Dynamic spacing — tightens as the grid grows to maximise plot area
     if n_cols <= 2:
@@ -340,7 +354,7 @@ def box_plot(
     plot_height = n_rows * per_row_h
 
     fig = make_subplots(
-        rows=n_rows, cols=cols_n,
+        rows=n_rows, cols=n_cols,
         subplot_titles=numerical_cols,
         horizontal_spacing=h_spacing,
         vertical_spacing=v_spacing,
@@ -370,7 +384,7 @@ def box_plot(
         fig.add_trace(go.Box(
             **box_data,
             name='',
-            marker_color=colors[idx % len(colors)],
+            marker_color=_NUMERICAL_COLORS[idx % len(_NUMERICAL_COLORS)],
             boxmean=False,
             showlegend=False,
             marker=dict(
@@ -453,17 +467,6 @@ def box_plot(
                          gridwidth=0.5, gridcolor='rgba(128,128,128,0.2)')
 
     return fig
-
-
-PALETTE = [
-    "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
-    "#FFA15A", "#19D3F3", "#FF6692",
-]
-
-_DARK_BG   = "#0e1117"
-_PLOT_BG   = "#1a1a1a"
-_GRID_CLR  = "rgba(128,128,128,0.2)"
-_FONT_CLR  = "white"
 
 
 def cross_tab_heatmap(
@@ -641,19 +644,6 @@ def correlation_heatmap(
                 row_text.append(f"{z[r, c]:.2f}")
         text_matrix.append(row_text)
 
-    # Diverging RdBu — reversed so blue=positive, red=negative (conventional)
-    colorscale = [
-        [0.0,  "#B2182B"],
-        [0.1,  "#D6604D"],
-        [0.2,  "#F4A582"],
-        [0.35, "#FDDBC7"],
-        [0.5,  "#F7F7F7"],
-        [0.65, "#D1E5F0"],
-        [0.8,  "#92C5DE"],
-        [0.9,  "#4393C3"],
-        [1.0,  "#2166AC"],
-    ]
-
     fig = go.Figure(go.Heatmap(
         z=z_display,
         x=labels,
@@ -661,7 +651,7 @@ def correlation_heatmap(
         text=text_matrix,
         texttemplate="%{text}",
         textfont=dict(size=10, color="white", family="Arial"),
-        colorscale=colorscale,
+        colorscale=_RDBU,
         zmid=0,
         zmin=-1,
         zmax=1,
@@ -867,40 +857,13 @@ def scatter_plot(
     return fig
 
 
-PALETTE = [
-    "#636EFA", "#EF553B", "#00CC96", "#AB63FA",
-    "#FFA15A", "#19D3F3", "#FF6692",
-]
- 
-_DARK_BG  = "#0e1117"
-_PLOT_BG  = "#1a1a1a"
-_GRID_CLR = "rgba(128,128,128,0.2)"
-_FONT_CLR = "white"
- 
-_RDBU = [
-    [0.0,  "#B2182B"],
-    [0.1,  "#D6604D"],
-    [0.2,  "#F4A582"],
-    [0.35, "#FDDBC7"],
-    [0.5,  "#F7F7F7"],
-    [0.65, "#D1E5F0"],
-    [0.8,  "#92C5DE"],
-    [0.9,  "#4393C3"],
-    [1.0,  "#2166AC"],
-]
- 
- 
 def _is_categorical_col(s: pd.Series) -> bool:
     """True for string/object/category dtypes, including PyArrow-backed variants."""
-    if pd.api.types.is_categorical_dtype(s):
-        return True
-    if pd.api.types.is_string_dtype(s):
+    if pd.api.types.is_categorical_dtype(s) or pd.api.types.is_string_dtype(s):
         return True
     # catches ArrowDtype('large_string'), ArrowDtype('string'), etc.
     dtype_str = str(s.dtype).lower()
-    if "string" in dtype_str or "object" in dtype_str:
-        return True
-    return False
+    return "string" in dtype_str or "object" in dtype_str
  
  
 def _normalize_size(s: pd.Series, lo: float = 5, hi: float = 50) -> np.ndarray:
@@ -1078,10 +1041,9 @@ def bubble_plot(
     # ── Size reference annotation (top-right, inside plot) ───────────────────
     # Three ghost bubbles with labels: Q25 / Q75 / Max of the size column.
     # Rendered as separate traces with no axis influence (visible in legend area).
-    size_labels = ["Q25", "Q75", "Max"]
     size_note_lines = [
-        f"● {size_labels[i]}  {refs[i]:.3g}"
-        for i in range(3)
+        f"● {label}  {ref:.3g}"
+        for label, ref in zip(("Q25", "Q75", "Max"), refs)
     ]
     size_block = (
         f"<b>Bubble size → {size}</b><br>"
