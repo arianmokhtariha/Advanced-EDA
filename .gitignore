@@ -10,6 +10,8 @@ __pycache__/
 .ipynb_checkpoints/
 .jupyter/
 
+EDA/00_test_visuals.ipynb
+
 PROMPT.md
 PROMPT.xml
 
