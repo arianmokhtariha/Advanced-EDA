@@ -1049,7 +1049,7 @@ def bubble_plot(
         f"<b>Bubble size → {size}</b><br>"
         + "<br>".join(size_note_lines)
     )
- 
+
     annotations = [dict(
         text=size_block,
         xref="paper", yref="paper",
@@ -1063,7 +1063,7 @@ def bubble_plot(
         borderpad=6,
         align="left",
     )]
- 
+
     # ── Layout ────────────────────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
@@ -1106,5 +1106,299 @@ def bubble_plot(
         annotations=annotations,
         margin=dict(l=80, r=80, t=90, b=80),
     )
- 
+
+    return fig
+
+
+def grouped_bar_plot(
+    df: pd.DataFrame,
+    group_col: str,
+    value_col: str,
+    agg: Literal['mean', 'median'] = 'mean',
+    ci_method: Optional[Literal['bootstrap', 'sem']] = 'bootstrap',
+    n_boot: int = 2000,
+    confidence: float = 0.95,
+    min_n_flag: int = 30,
+    top_n: Optional[int] = None,
+    ascending: bool = False,
+    title: str = "",
+    width: int = 1400,
+) -> go.Figure:
+    """
+    Ranked bar chart comparing an aggregated numeric value across groups.
+
+    Each bar is one category of `group_col`. Error bars show a confidence
+    interval around the aggregate so a viewer can judge whether groups are
+    actually distinguishable rather than just eyeballing bar heights. Groups
+    with fewer than `min_n_flag` observations get a gold outline and a "⚠"
+    next to their sample-size label — this is descriptive only, formal group
+    tests belong in notebook 05.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    group_col : str
+        Categorical column defining the groups (x-axis).
+    value_col : str
+        Numerical column being aggregated (y-axis).
+    agg : {'mean', 'median'}, default 'mean'
+    ci_method : {'bootstrap', 'sem', None}, default 'bootstrap'
+        'bootstrap' resamples each group `n_boot` times (valid for mean or
+        median, robust to skew). 'sem' uses mean ± z·SEM and is only offered
+        for agg='mean' — a closed-form SEM for the median doesn't generally
+        exist, so agg='median' silently uses bootstrap even if 'sem' is
+        passed. None disables error bars.
+    n_boot : int, default 2000
+        Bootstrap resamples per group (only used when ci_method='bootstrap').
+    confidence : float, default 0.95
+        Confidence level for the interval.
+    min_n_flag : int, default 30
+        Groups with fewer observations than this are flagged, not dropped.
+    top_n : int, optional
+        Keep only the top N groups after sorting — useful for high-
+        cardinality group columns (e.g. competitions).
+    ascending : bool, default False
+        Sort direction by the aggregated value.
+    title : str
+    width : int, default 1400
+
+    Returns
+    -------
+    go.Figure
+    """
+    working = df[[group_col, value_col]].dropna()
+    if working.empty:
+        raise ValueError("No rows remain after dropping nulls for group_col/value_col.")
+
+    agg_func = np.mean if agg == 'mean' else np.median
+    effective_ci_method = ci_method
+    if agg == 'median' and ci_method == 'sem':
+        effective_ci_method = 'bootstrap'
+
+    rows = []
+    for grp, sub in working.groupby(group_col)[value_col]:
+        vals = sub.to_numpy(dtype=float)
+        n = len(vals)
+        point = float(agg_func(vals))
+        lo = hi = np.nan
+
+        if effective_ci_method and n >= 2:
+            if effective_ci_method == 'bootstrap':
+                res = stats.bootstrap(
+                    (vals,), agg_func, confidence_level=confidence,
+                    n_resamples=n_boot, method='basic', random_state=0,
+                )
+                lo, hi = res.confidence_interval.low, res.confidence_interval.high
+            else:  # sem
+                sem = np.std(vals, ddof=1) / np.sqrt(n)
+                z = stats.norm.ppf(0.5 + confidence / 2)
+                lo, hi = point - z * sem, point + z * sem
+
+        rows.append({'group': grp, 'value': point, 'n': n, 'ci_lo': lo, 'ci_hi': hi})
+
+    stats_df = pd.DataFrame(rows).sort_values('value', ascending=ascending)
+    if top_n is not None:
+        stats_df = stats_df.head(top_n)
+
+    groups   = stats_df['group'].astype(str).tolist()
+    values   = stats_df['value'].tolist()
+    ns       = stats_df['n'].tolist()
+    err_plus  = np.nan_to_num(stats_df['ci_hi'] - stats_df['value']).tolist()
+    err_minus = np.nan_to_num(stats_df['value'] - stats_df['ci_lo']).tolist()
+
+    colors = [
+        _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)] if n >= min_n_flag else _OTHER_COLOR
+        for i, n in enumerate(ns)
+    ]
+    line_widths = [2 if n < min_n_flag else 0 for n in ns]
+
+    fig = go.Figure(go.Bar(
+        x=groups,
+        y=values,
+        marker=dict(
+            color=colors,
+            line=dict(width=line_widths, color='#FFD700'),
+        ),
+        error_y=dict(
+            type='data',
+            symmetric=False,
+            array=err_plus,
+            arrayminus=err_minus,
+            color='rgba(255,255,255,0.6)',
+            thickness=1.5,
+            width=4,
+        ) if effective_ci_method else None,
+        text=[f"n={n}" + (" ⚠" if n < min_n_flag else "") for n in ns],
+        textposition='outside',
+        textfont=dict(size=10),
+        cliponaxis=False,
+        customdata=ns,
+        hovertemplate=(
+            f"<b>%{{x}}</b><br>{agg.capitalize()} {value_col}: %{{y:.3g}}"
+            f"<br>n=%{{customdata}}<extra></extra>"
+        ),
+    ))
+
+    y_top = max(v + e for v, e in zip(values, err_plus))
+    y_bot = min(v - e for v, e in zip(values, err_minus))
+    headroom = (y_top - y_bot) * 0.15 or abs(y_top) * 0.15 or 1.0
+
+    plot_title = title if title else f"{agg.capitalize()} {value_col} by {group_col}"
+    ci_note = (
+        f"Error bars: {int(confidence * 100)}% {effective_ci_method} CI"
+        if effective_ci_method else "No confidence interval shown"
+    )
+    low_n_note = f" · gold outline = n < {min_n_flag}" if any(n < min_n_flag for n in ns) else ""
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{plot_title}</b><br><sup>{ci_note}{low_n_note}</sup>",
+            font=dict(size=18, color=_FONT_CLR, family="Arial"),
+            x=0.5, xanchor="center",
+        ),
+        template="plotly_dark",
+        width=width,
+        height=560,
+        paper_bgcolor=_DARK_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=dict(color=_FONT_CLR, family="Arial"),
+        showlegend=False,
+        xaxis=dict(
+            title=dict(text=group_col, font=dict(size=13)),
+            tickfont=dict(size=11),
+            tickangle=-35,
+        ),
+        yaxis=dict(
+            title=dict(text=f"{agg.capitalize()} {value_col}", font=dict(size=13)),
+            showgrid=True,
+            gridwidth=0.5,
+            gridcolor=_GRID_CLR,
+            range=[min(0, y_bot - headroom * 0.3), y_top + headroom],
+        ),
+        margin=dict(l=80, r=60, t=110, b=90),
+    )
+
+    return fig
+
+
+def grouped_box_plot(
+    df: pd.DataFrame,
+    group_col: str,
+    value_col: str,
+    sort_by: Literal['median', 'mean', 'n'] = 'median',
+    ascending: bool = False,
+    top_n: Optional[int] = None,
+    min_n_flag: int = 30,
+    title: str = "",
+    width: int = 1400,
+) -> go.Figure:
+    """
+    Distribution comparison of a numeric value across categorical groups.
+
+    One box per group, ranked by `sort_by`, so shape and spread — not just
+    the point estimate — are visible when comparing groups. Complements
+    `grouped_bar_plot`, which only shows the aggregate ± CI. Whiskers use
+    Plotly's standard 1.5×IQR fence (same convention as `box_plot`). Groups
+    with fewer than `min_n_flag` observations get a gold outline and a
+    flagged sample-size annotation.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    group_col : str
+        Categorical column defining the groups (x-axis).
+    value_col : str
+        Numerical column being compared (y-axis).
+    sort_by : {'median', 'mean', 'n'}, default 'median'
+        Statistic used to order the groups left-to-right.
+    ascending : bool, default False
+        Sort direction.
+    top_n : int, optional
+        Keep only the top N groups (by `sort_by`, after sorting) — useful
+        for high-cardinality group columns (e.g. competitions).
+    min_n_flag : int, default 30
+        Groups with fewer observations than this are flagged, not dropped.
+    title : str
+    width : int, default 1400
+
+    Returns
+    -------
+    go.Figure
+    """
+    working = df[[group_col, value_col]].dropna()
+    if working.empty:
+        raise ValueError("No rows remain after dropping nulls for group_col/value_col.")
+
+    grouped = working.groupby(group_col)[value_col]
+    summary = grouped.agg(median='median', mean='mean', n='count')
+    summary = summary.sort_values(sort_by, ascending=ascending)
+    if top_n is not None:
+        summary = summary.head(top_n)
+
+    ordered_groups = summary.index.tolist()
+
+    fig = go.Figure()
+    for i, grp in enumerate(ordered_groups):
+        vals  = grouped.get_group(grp).to_numpy(dtype=float)
+        n     = int(summary.loc[grp, 'n'])
+        low_n = n < min_n_flag
+        color = _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)]
+
+        fig.add_trace(go.Box(
+            y=vals,
+            name=str(grp),
+            marker_color=color,
+            boxmean=True,
+            line=dict(width=2, color='#FFD700' if low_n else color),
+            marker=dict(
+                size=4,
+                outliercolor='rgba(220,220,220,0.6)',
+                line=dict(outliercolor='rgba(220,220,220,0.6)', outlierwidth=1),
+            ),
+            showlegend=False,
+            hovertemplate=f"<b>{group_col}</b>: {grp}<br><b>{value_col}</b>: %{{y}}<extra></extra>",
+        ))
+
+    annotations = [
+        dict(
+            x=str(grp), y=1.02, xref='x', yref='paper',
+            text=f"n={int(summary.loc[grp, 'n'])}" + (" ⚠" if summary.loc[grp, 'n'] < min_n_flag else ""),
+            showarrow=False,
+            yanchor='bottom',
+            font=dict(size=10, color='#FFD700' if summary.loc[grp, 'n'] < min_n_flag else '#AAAAAA'),
+        )
+        for grp in ordered_groups
+    ]
+
+    plot_title = title if title else f"{value_col} distribution by {group_col}"
+    low_n_note = f"gold outline / ⚠ = n < {min_n_flag}" if (summary['n'] < min_n_flag).any() else ""
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{plot_title}</b>" + (f"<br><sup>{low_n_note}</sup>" if low_n_note else ""),
+            font=dict(size=18, color=_FONT_CLR, family="Arial"),
+            x=0.5, xanchor="center",
+        ),
+        template="plotly_dark",
+        width=width,
+        height=600,
+        paper_bgcolor=_DARK_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=dict(color=_FONT_CLR, family="Arial"),
+        showlegend=False,
+        xaxis=dict(
+            title=dict(text=group_col, font=dict(size=13)),
+            tickfont=dict(size=11),
+            tickangle=-35,
+        ),
+        yaxis=dict(
+            title=dict(text=value_col, font=dict(size=13)),
+            showgrid=True,
+            gridwidth=0.5,
+            gridcolor=_GRID_CLR,
+        ),
+        annotations=annotations,
+        margin=dict(l=80, r=60, t=120, b=90),
+    )
+
     return fig
