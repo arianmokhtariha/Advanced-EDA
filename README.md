@@ -160,9 +160,9 @@ All charts come from the project's own plotting library and share one dark visua
 
 <div align="center">
 
-<img src="assets/club_features_distributions.png" width="92%" alt="Distributions of twelve engineered club-level metrics">
+<img src="assets/multivar_bubble_plot.png" width="92%" alt="Distributions of twelve engineered club-level metrics">
 
-*Notebook 03 — every engineered club metric sanity-checked at a glance: 12 distributions with mean/median overlays, one `distribution_plot()` call.*
+*Notebook 04 — complex multi-variable bubble plot showing the relation between goals scored/conceded per game , win rate and average attendance of each club*
 
 <br><br>
 
