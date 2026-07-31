@@ -6,8 +6,10 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import scipy.cluster.hierarchy as sch
 import scipy.stats as stats
 from plotly.subplots import make_subplots
+from scipy.spatial.distance import squareform
 
 
 # ── Shared aesthetic constants ───────────────────────────────────────────────
@@ -32,7 +34,8 @@ _PLOT_BG = "#1a1a1a"
 _GRID_CLR = "rgba(128,128,128,0.2)"
 _FONT_CLR = "white"
 
-# Diverging RdBu (blue = positive, red = negative) for correlation & bubble colour
+# Diverging RdBu (blue = positive, red = negative) for bubble_plot's colour axis.
+# Markers carry no text, so its light midpoint costs nothing there.
 _RDBU = [
     [0.0,  "#B2182B"],
     [0.1,  "#D6604D"],
@@ -43,6 +46,29 @@ _RDBU = [
     [0.8,  "#92C5DE"],
     [0.9,  "#4393C3"],
     [1.0,  "#2166AC"],
+]
+
+# Dark-surface diverging ramp for correlation_heatmap, where every cell carries
+# a white r-value label. Classic RdBu peaks near-white at r ≈ 0 (1.1:1 against
+# white text — illegible), so this ramp is anchored on a neutral dark slate at
+# the midpoint and interpolated outward in OKLab to the same red/blue poles.
+# Every stop clears WCAG 4.5:1 against white (worst case 4.6:1 at the poles) and
+# lightness is monotone along each arm, so salience now scales with |r| — weak
+# correlations recede instead of glaring. Plotly's heatmap ``textfont.color`` is
+# scalar-only, so per-cell adaptive text colour is not an option; the ramp has to
+# carry the legibility.
+_CORR_DIVERGING = [
+    [0.0, "#E3223A"],
+    [0.1, "#C90430"],
+    [0.2, "#A61A30"],
+    [0.3, "#7C2B35"],
+    [0.4, "#503038"],
+    [0.5, "#272C35"],
+    [0.6, "#273B55"],
+    [0.7, "#204978"],
+    [0.8, "#16579A"],
+    [0.9, "#1566B6"],
+    [1.0, "#2877C8"],
 ]
 
 # Severity ramp for the missing-values plot: healthy green → amber → alarm red.
@@ -201,6 +227,150 @@ def _p_stars(p: float) -> str:
 def _fmt_p(p: float) -> str:
     """Format a p-value as ``p<0.001`` below the floor, else ``p=0.043``."""
     return "p<0.001" if p < 0.001 else f"p={p:.3f}"
+
+
+def _corr_similarity(
+    corr: pd.DataFrame,
+    order_on: Literal["signed", "abs"],
+) -> np.ndarray:
+    """
+    Coerce a correlation matrix into a clean symmetric similarity matrix.
+
+    Zero-variance columns produce all-NaN correlations; those pairs are treated
+    as unrelated (r = 0) **for seriation only** — the displayed matrix keeps its
+    NaNs. The result is re-symmetrised because floating-point noise makes
+    ``corr`` very slightly asymmetric, which ``squareform`` rejects.
+
+    Parameters
+    ----------
+    corr : pd.DataFrame
+        Square correlation matrix.
+    order_on : {'signed', 'abs'}
+        ``'abs'`` folds sign away so that a strong negative pair counts as
+        closely related; ``'signed'`` keeps direction.
+
+    Returns
+    -------
+    np.ndarray
+        Symmetric similarity matrix with a unit diagonal.
+    """
+    sim = np.nan_to_num(corr.to_numpy(dtype=float), nan=0.0)
+    if order_on == "abs":
+        sim = np.abs(sim)
+    sim = (sim + sim.T) / 2.0
+    np.fill_diagonal(sim, 1.0)
+    return sim
+
+
+def _corr_order(
+    corr: pd.DataFrame,
+    order: Literal["original", "cluster", "angle", "pc1", "alphabet"],
+    order_on: Literal["signed", "abs"],
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Compute a seriation permutation for a correlation matrix.
+
+    Seriation applies one permutation to **both** axes so related variables sit
+    next to each other and the matrix collapses into blocks along the diagonal.
+    Three data-driven strategies are offered because they answer different
+    questions: ``'cluster'`` finds hard groups, ``'angle'`` and ``'pc1'`` lay the
+    variables out along a smooth gradient with no group boundaries implied.
+
+    ``'cluster'`` uses **average linkage** — the only common linkage family that
+    stays valid on a *precomputed*, non-Euclidean distance. Ward and centroid
+    linkage assume Euclidean raw coordinates and are silently wrong here. The
+    leaf order is then refined by ``optimal_leaf_ordering``, which rotates each
+    dendrogram branch to minimise the distance between adjacent leaves (the tree
+    itself is unchanged — only the drawing order is).
+
+    Parameters
+    ----------
+    corr : pd.DataFrame
+        Square correlation matrix.
+    order : {'original', 'cluster', 'angle', 'pc1', 'alphabet'}
+        Seriation strategy; see ``correlation_heatmap`` for the descriptions.
+    order_on : {'signed', 'abs'}
+        Whether the underlying similarity keeps the sign of ``r``.
+
+    Returns
+    -------
+    tuple of (np.ndarray, np.ndarray or None)
+        The permutation of column indices, and the linkage matrix when
+        ``order='cluster'`` (needed to cut flat clusters) else ``None``.
+    """
+    labels = corr.columns.tolist()
+    n = len(labels)
+    if order == "original" or n < 3:
+        return np.arange(n), None
+    if order == "alphabet":
+        return np.array(sorted(range(n), key=lambda i: str(labels[i]))), None
+
+    sim = _corr_similarity(corr, order_on)
+
+    if order in ("angle", "pc1"):
+        # Friendly (2002): project each variable onto the plane of the two
+        # leading eigenvectors of the correlation matrix, then read the
+        # variables off in angular order around that plane.
+        _, eigvecs = np.linalg.eigh(sim)          # eigh returns ascending
+        e1, e2 = eigvecs[:, -1], eigvecs[:, -2]
+        if e1.sum() < 0:                          # eigenvector sign is arbitrary
+            e1, e2 = -e1, -e2                     # pin it for reproducibility
+        if order == "pc1":
+            return np.argsort(e1, kind="stable"), None
+        # arctan2 is the numerically safe form of Friendly's atan(e2/e1) branch
+        # rule — it differs only in where the circle is cut open into a line.
+        return np.argsort(np.arctan2(e2, e1), kind="stable"), None
+
+    # order == 'cluster'. Both distances are bounded in [0, 1]: signed maps
+    # r=+1 → 0 and r=-1 → 1, absolute maps |r|=1 → 0 and r=0 → 1.
+    dist = (1.0 - sim) if order_on == "abs" else (1.0 - sim) / 2.0
+    np.fill_diagonal(dist, 0.0)
+    condensed = squareform(np.clip(dist, 0.0, None), checks=False)
+    linkage = sch.linkage(condensed, method="average")
+    # Optimal leaf ordering is O(n^3); trivial at EDA-sized matrices but worth
+    # skipping if someone throws a few hundred columns at it.
+    if n <= 150:
+        linkage = sch.optimal_leaf_ordering(linkage, condensed)
+    return sch.leaves_list(linkage), linkage
+
+
+def _cluster_block_sizes(
+    linkage: np.ndarray,
+    perm: np.ndarray,
+    n_clusters: int,
+) -> List[int]:
+    """
+    Cut a dendrogram into ``n_clusters`` groups and measure the diagonal blocks.
+
+    Because any leaf order of a dendrogram keeps each subtree contiguous, the
+    flat clusters are guaranteed to form unbroken runs once reordered by
+    ``perm`` — so the run lengths are exactly the block sizes to outline.
+
+    Parameters
+    ----------
+    linkage : np.ndarray
+        Linkage matrix from ``_corr_order``.
+    perm : np.ndarray
+        The leaf-order permutation applied to the matrix.
+    n_clusters : int
+        Number of flat clusters to cut.
+
+    Returns
+    -------
+    list of int
+        Consecutive block sizes along the reordered diagonal.
+    """
+    flat = sch.fcluster(linkage, t=n_clusters, criterion="maxclust")[perm]
+    sizes: List[int] = []
+    run = 1
+    for i in range(1, len(flat)):
+        if flat[i] == flat[i - 1]:
+            run += 1
+        else:
+            sizes.append(run)
+            run = 1
+    sizes.append(run)
+    return sizes
 
 
 def _is_categorical_col(s: pd.Series) -> bool:
@@ -1476,16 +1646,29 @@ def correlation_heatmap(
     threshold: float = 0.0,
     triangle: Literal["full", "lower"] = "full",
     show_significance: bool = False,
+    order: Literal["original", "cluster", "angle", "pc1", "alphabet"] = "original",
+    order_on: Literal["signed", "abs"] = "signed",
+    n_clusters: Optional[int] = None,
     title: str = "",
     width: Optional[int] = None,
     height: Optional[int] = None,
 ) -> go.Figure:
     """
-    Annotated correlation matrix with optional significance stars.
+    Annotated correlation matrix with optional seriation and significance stars.
 
-    Colour diverges around zero (blue positive, red negative, grey ≈ 0). The
-    diagonal and any ``|r| < threshold`` cells are masked for readability;
-    ``triangle='lower'`` additionally hides the redundant upper triangle.
+    Colour diverges around zero on a dark-anchored ramp (blue positive, red
+    negative, near-black ≈ 0) so salience scales with ``|r|`` and the white
+    in-cell labels stay legible at every value. The diagonal and any
+    ``|r| < threshold`` cells are masked for readability; ``triangle='lower'``
+    additionally hides the redundant upper triangle.
+
+    ``order`` **seriates** the matrix — one permutation applied to both axes so
+    related variables become adjacent and the structure collapses into blocks
+    along the diagonal. Alphabetical or load order usually scatters that
+    structure; seriation is what makes it visible. This is a reordering of an
+    existing matrix, not a model: it changes nothing about the correlations
+    themselves, and the blocks it reveals are descriptive groupings, not
+    evidence of a latent factor.
 
     With ``show_significance`` each cell gains stars from a p-value computed on
     **pairwise-complete** observations (matching how ``DataFrame.corr`` forms r).
@@ -1509,6 +1692,36 @@ def correlation_heatmap(
         ``'lower'`` masks the upper triangle and diagonal (de-duplicated view).
     show_significance : bool, default False
         Append significance stars and show n(pairwise)/p in the hover.
+    order : {'original', 'cluster', 'angle', 'pc1', 'alphabet'}, default 'original'
+        Row/column ordering:
+
+        - ``'original'`` — keep the dataframe's column order (no seriation).
+        - ``'cluster'`` — hierarchical clustering (average linkage) on the
+          correlation distance, refined by optimal leaf ordering. Produces hard
+          blocks; the right choice when the question is *which variables group
+          together*. Required for ``n_clusters``.
+        - ``'angle'`` — angular order of the two leading eigenvectors
+          (Friendly, 2002). Lays variables on a smooth gradient and implies no
+          group boundaries — safer when the block structure is weak and
+          clustering would invent groups that are not really there.
+        - ``'pc1'`` — sort by loading on the first principal component; a
+          one-dimensional version of ``'angle'``.
+        - ``'alphabet'`` — alphabetical; for looking a variable up, not for
+          seeing structure.
+    order_on : {'signed', 'abs'}, default 'signed'
+        Which similarity the seriation runs on — a genuine choice with different
+        answers, not an implementation detail. ``'signed'`` uses distance
+        ``(1 - r) / 2``, grouping variables that move in the *same direction* and
+        pushing strongly anti-correlated pairs far apart. ``'abs'`` uses
+        ``1 - |r|``, grouping variables that share information regardless of
+        sign, so an anti-correlated pair sits adjacent and its block reads red.
+        Use ``'signed'`` to find variables that behave alike, ``'abs'`` to find
+        redundancy. Ignored when ``order`` is ``'original'`` or ``'alphabet'``.
+    n_clusters : int, optional
+        Cut the dendrogram into this many flat clusters and outline the
+        resulting diagonal blocks. Requires ``order='cluster'``. The count is a
+        **visual aid you choose**, not a result the data supports — nothing here
+        estimates an optimal k.
     title : str, default ""
         Main title; empty auto-generates a sensible title.
     width : int, optional
@@ -1534,8 +1747,25 @@ def correlation_heatmap(
         )
 
     corr = num.corr(method=method)
+    n = corr.shape[1]
+
+    if n_clusters is not None:
+        if order != "cluster":
+            raise ValueError(
+                "n_clusters requires order='cluster' — the other orderings "
+                "build no dendrogram to cut."
+            )
+        if not 2 <= n_clusters <= n:
+            raise ValueError(
+                f"n_clusters must be between 2 and {n} (got {n_clusters})."
+            )
+
+    perm, linkage = _corr_order(corr, order, order_on)
+    if not np.array_equal(perm, np.arange(n)):
+        corr = corr.iloc[perm, perm]
+        num = num.iloc[:, perm]      # keep the pairwise p-value loop aligned
+
     labels = corr.columns.tolist()
-    n = len(labels)
     z = corr.values
 
     test_fn = {
@@ -1593,7 +1823,8 @@ def correlation_heatmap(
         z=z_display, x=labels, y=labels, text=text_matrix,
         texttemplate="%{text}", textfont=dict(size=10, color="white",
                                               family="Arial"),
-        colorscale=_RDBU, zmid=0, zmin=-1, zmax=1, customdata=customdata,
+        colorscale=_CORR_DIVERGING, zmid=0, zmin=-1, zmax=1,
+        customdata=customdata,
         colorbar=dict(
             title=dict(text=method.capitalize(),
                        font=dict(size=12, color=_FONT_CLR, family="Arial")),
@@ -1604,11 +1835,36 @@ def correlation_heatmap(
         hovertemplate=hovertemplate,
     ))
 
+    if n_clusters is not None and linkage is not None:
+        # Outline each diagonal block. Cell k spans [k-0.5, k+0.5] in data
+        # coords, so a block of rows s..e is bounded by s-0.5 and e+0.5.
+        start = 0
+        for size in _cluster_block_sizes(linkage, perm, n_clusters):
+            lo, hi = start - 0.5, start + size - 0.5
+            fig.add_shape(
+                type="rect", xref="x", yref="y",
+                x0=lo, x1=hi, y0=lo, y1=hi,
+                line=dict(color="rgba(255,255,255,0.55)", width=2),
+                fillcolor="rgba(0,0,0,0)", layer="above",
+            )
+            start += size
+
     thr_note = f"  ·  |r| < {threshold} masked" if threshold > 0 else ""
     tri_note = "  ·  lower triangle" if triangle == "lower" else ""
     sig_note = ("  ·  * p<.05 ** p<.01 *** p<.001 — uncorrected, descriptive only"
                 if show_significance else "")
-    subtitle = f"{method.capitalize()} correlation{thr_note}{tri_note}{sig_note}"
+    dist_note = "1−|r|" if order_on == "abs" else "(1−r)/2"
+    order_note = {
+        "original": "",
+        "alphabet": "  ·  alphabetical order",
+        "cluster": f"  ·  seriated: average-linkage clustering on {dist_note}",
+        "angle": f"  ·  seriated: angular eigenvector order on {dist_note}",
+        "pc1": f"  ·  seriated: first-PC loading on {dist_note}",
+    }[order]
+    blk_note = (f"  ·  {n_clusters} blocks outlined"
+                if n_clusters is not None else "")
+    subtitle = (f"{method.capitalize()} correlation{thr_note}{tri_note}"
+                f"{order_note}{blk_note}{sig_note}")
 
     cell_px = max(38, min(70, 900 // n))
     size = n * cell_px + 200
