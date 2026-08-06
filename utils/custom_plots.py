@@ -34,6 +34,12 @@ _PLOT_BG = "#1a1a1a"
 _GRID_CLR = "rgba(128,128,128,0.2)"
 _FONT_CLR = "white"
 
+# Subplot-grid layout budget, in px. Every grid dimension derives from these
+# three tokens, so grids stay uniform at any size. See _grid_geometry.
+_ROW_GAP_PX = 90     # between rows: lower row's title + upper row's tick labels
+_COL_GAP_PX = 110    # between columns: tick labels + breathing room
+_ROW_PLOT_PX = 260   # drawing area reserved for one subplot row
+
 # Diverging RdBu (blue = positive, red = negative) for bubble_plot's colour axis.
 # Markers carry no text, so its light midpoint costs nothing there.
 _RDBU = [
@@ -123,9 +129,29 @@ def _interp_hex(frac: float, stops: List[Tuple[float, str]]) -> str:
     return stops[-1][1]
 
 
-def _grid_geometry(n_plots: int, n_cols: int) -> Tuple[int, float, float, int]:
+def _grid_geometry(
+    n_plots: int,
+    n_cols: int,
+    width: int,
+    height: Optional[int] = None,
+) -> Tuple[int, float, float, int]:
     """
     Compute subplot-grid geometry shared by the grid-based plots.
+
+    Plotly expresses ``horizontal_spacing``/``vertical_spacing`` as a fraction of
+    the *whole figure*, not as a gap between neighbouring panels. A fixed
+    fraction therefore silently starves large grids: the gaps scale with the
+    panel count while the figure does not, so at ``v_spacing=0.12`` with nine
+    rows the eight gaps consume 96% of the figure and every subplot collapses to
+    ~11px of drawing area.
+
+    Both gaps are consequently declared as **pixel budgets** and converted
+    against the dimension they are measured along, which holds the whitespace
+    between panels visually constant however many panels there are. Row height
+    is a flat per-row budget for the same reason: every subplot gets the same
+    drawing area whether the grid holds two panels or twenty. Each spacing is
+    capped at half its axis so gaps can never out-consume the panels even when
+    the caller forces a small ``height``.
 
     Parameters
     ----------
@@ -133,30 +159,31 @@ def _grid_geometry(n_plots: int, n_cols: int) -> Tuple[int, float, float, int]:
         Number of subplots to lay out.
     n_cols : int
         Requested number of grid columns.
+    width : int
+        Figure width in px, used to convert the column gap to a fraction.
+    height : int, optional
+        Caller's explicit figure height in px. ``None`` derives it from the row
+        count. Passed in so the pixel→fraction conversion uses the height the
+        figure is actually rendered at.
 
     Returns
     -------
     tuple of (int, float, float, int)
-        ``(n_rows, h_spacing, v_spacing, per_row_height)`` where the spacings
-        tighten as the grid widens and the per-row height compacts as it grows
-        taller — so large grids stay readable without exploding the figure.
+        ``(n_rows, h_spacing, v_spacing, final_height)`` — the resolved figure
+        height is returned so callers do not each re-derive it.
     """
     n_rows = math.ceil(n_plots / n_cols)
-    if n_cols <= 2:
-        h_spacing, v_spacing = 0.10, 0.12
-    elif n_cols == 3:
-        h_spacing, v_spacing = 0.07, 0.11
-    elif n_cols == 4:
-        h_spacing, v_spacing = 0.05, 0.10
-    else:
-        h_spacing, v_spacing = 0.03, 0.08
-    # Plotly caps spacing at 1/(dim-1); tall/wide grids must clamp to stay valid
-    if n_rows > 1:
-        v_spacing = min(v_spacing, 1.0 / (n_rows - 1))
-    if n_cols > 1:
-        h_spacing = min(h_spacing, 1.0 / (n_cols - 1))
-    per_row_height = 380 if n_rows <= 3 else (320 if n_rows <= 6 else 270)
-    return n_rows, h_spacing, v_spacing, per_row_height
+    final_height = (
+        height if height is not None
+        else n_rows * (_ROW_PLOT_PX + _ROW_GAP_PX)
+    )
+    v_spacing = (
+        min(_ROW_GAP_PX / final_height, 0.5 / (n_rows - 1)) if n_rows > 1 else 0.0
+    )
+    h_spacing = (
+        min(_COL_GAP_PX / width, 0.5 / (n_cols - 1)) if n_cols > 1 else 0.0
+    )
+    return n_rows, h_spacing, v_spacing, final_height
 
 
 def _apply_base_layout(
@@ -473,8 +500,9 @@ def distribution_plot(
     column_types = {col: _classify(col) for col in cols_to_plot}
 
     n_plots = len(cols_to_plot)
-    n_rows, h_spacing, v_spacing, per_row_h = _grid_geometry(n_plots, n_cols)
-    final_height = height if height is not None else n_rows * per_row_h
+    n_rows, h_spacing, v_spacing, final_height = _grid_geometry(
+        n_plots, n_cols, width=width, height=height
+    )
 
     fig = make_subplots(
         rows=n_rows,
@@ -711,8 +739,9 @@ def box_plot(
         )
 
     n = len(numerical_cols)
-    n_rows, h_spacing, v_spacing, per_row_h = _grid_geometry(n, n_cols)
-    final_height = height if height is not None else n_rows * per_row_h
+    n_rows, h_spacing, v_spacing, final_height = _grid_geometry(
+        n, n_cols, width=width, height=height
+    )
     is_h = orientation == "horizontal"
     orient = "h" if is_h else "v"
     rng = np.random.default_rng(0)
@@ -1058,8 +1087,9 @@ def qq_plot(
         )
 
     n = len(cols_list)
-    n_rows, h_spacing, v_spacing, per_row_h = _grid_geometry(n, n_cols)
-    final_height = height if height is not None else n_rows * per_row_h
+    n_rows, h_spacing, v_spacing, final_height = _grid_geometry(
+        n, n_cols, width=width, height=height
+    )
 
     fig = make_subplots(
         rows=n_rows, cols=n_cols, subplot_titles=cols_list,
