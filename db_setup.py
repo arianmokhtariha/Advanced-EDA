@@ -1,180 +1,117 @@
-import sys
-import re
-import time
-import threading
-import itertools
-import psycopg2
-from psycopg2 import sql
-import pandas as pd
-from pathlib import Path
-from db_config import DB_CONFIG, DB_CONFIG_INIT
+"""
+PostgreSQL project bootstrapper.
 
+Creates a PostgreSQL database, applies a directory of versioned .sql files
+to it, and loads a set of CSV files into the resulting tables.
 
-# Personal Note: Only change SCHEMA_SQL and CSV_TABLE_MAPPING for different projects
+Reusable across projects: to retarget it, edit ONLY the CONFIG block below.
+Nothing further down is project-specific.
 
-# Schema definition: list of CREATE TABLE statements
-# (Important) Ordered by dependency to avoid Foreign Key violations
-SCHEMA_SQL = """
-DROP TABLE IF EXISTS game_events CASCADE;
-DROP TABLE IF EXISTS appearances CASCADE;
-DROP TABLE IF EXISTS games CASCADE;
-DROP TABLE IF EXISTS players CASCADE;
-DROP TABLE IF EXISTS clubs CASCADE;
-DROP TABLE IF EXISTS competitions CASCADE;
-
-CREATE TABLE competitions
-(
-    competition_id varchar(4)  not null    primary key,
-    name           varchar(64) not null,
-    type           varchar(32) not null,
-    country_name   varchar(16)
-);
-
-CREATE TABLE clubs
-(
-    club_id                 integer     not null    primary key,
-    name                    varchar(64) not null,
-    domestic_competition_id varchar(4)  not null
-        constraint fk_domestic_competition_id
-            references competitions,
-    squad_size              integer     not null,
-    foreigners_number       integer     not null,
-    national_team_players   integer     not null,
-    stadium_name            varchar(64) not null,
-    stadium_seats           integer     not null,
-    net_transfer_record     varchar(16) not null
-);
-
-CREATE TABLE players
-(
-    player_id                integer     not null
-        primary key,
-    current_club_id          integer     not null
-        constraint fk_current_club_id
-            references clubs,
-    player_code              varchar(64) not null,
-    country_of_birth         varchar(32),
-    city_of_birth            varchar(64),
-    country_of_citizenship   varchar(32),
-    date_of_birth            date,
-    sub_position             varchar(32),
-    position                 varchar(16),
-    foot                     varchar(8),
-    height_in_cm             integer,
-    contract_expiration_date date
-);
-
-CREATE TABLE games
-(
-    game_id         integer     not null    primary key,
-    competition_id  varchar(4)  not null
-        constraint fk_competition_id
-            references competitions,
-    season          integer     not null,
-    date            date        not null,
-    home_club_id    integer     not null
-        constraint fk_home_club_id
-            references clubs,
-    away_club_id    integer     not null
-        constraint fk_away_club_id
-            references clubs,
-    home_club_goals integer     not null,
-    away_club_goals integer     not null,
-    stadium         varchar(64) not null,
-    attendance      integer
-);
-
-CREATE TABLE appearances
-(
-    appearance_id  varchar(16)   not null   primary key,
-    game_id        integer     not null
-        constraint fk_game_id
-            references games,
-    player_id      integer     not null
-        constraint fk_player_id
-            references players,
-    yellow_cards   integer     not null,
-    red_cards      integer     not null,
-    goals          integer     not null,
-    assists        integer     not null,
-    minutes_played integer     not null
-);
-
-CREATE TABLE game_events
-(
-    game_event_id    integer     not null    primary key,
-    game_id          integer     not null
-        constraint fk_game_id_1
-            references games,
-    minute           integer     not null,
-    type             varchar(16) not null,
-    player_id        integer     not null
-        constraint fk_player_id
-            references players,
-    player_in_id     integer
-        constraint fk_player_in_id
-            references players,
-    player_assist_id integer
-        constraint fk_player_assist_id
-            references players
-);
+Usage:
+    python db_setup.py
 """
 
-# CSV to table mapping: {rel_csv_path: table_name}
-# (Important) Order by dependency to ensure parent records exist before child records
-CSV_TABLE_MAPPING = {
-    r"raw_data/competitions.csv" : "competitions",
-    r"raw_data/clubs.csv"        : "clubs",
-    r"raw_data/players.csv"      : "players",
-    r"raw_data/games.csv"        : "games",
-    r"raw_data/appearances.csv"  : "appearances",
-    r"raw_data/game_events.csv"  : "game_events"
+import csv
+import io
+import itertools
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pandas as pd
+import psycopg2
+from psycopg2 import extensions, sql
+
+from db_config import DB_CONFIG, DB_CONFIG_INIT
+
+_ROOT = Path(__file__).parent
+
+# ============================================================
+# CONFIG — the only block to edit per project
+# ============================================================
+
+# Every *.sql file in this directory is executed in filename order, each as
+# a single batch, exactly as written. Number the files to control the order:
+#   00_schema.sql, 10_indexes.sql, 20_views.sql
+SCHEMA_DIR: Path = _ROOT / "sql"
+
+# {csv path relative to this file: target table}
+# (Important) Order parent tables before child tables so foreign keys resolve.
+# Table names may be schema-qualified, e.g. "raw.sales".
+CSV_MAPPING: dict[str, str] = {
+    "raw_data/competitions.csv": "competitions",
+    "raw_data/clubs.csv":        "clubs",
+    "raw_data/players.csv":      "players",
+    "raw_data/games.csv":        "games",
+    "raw_data/appearances.csv":  "appearances",
+    "raw_data/game_events.csv":  "game_events",
 }
 
-# ============================================
+# "stream" — pipe the CSV straight into Postgres and let Postgres parse it.
+#            Values land byte-exact and memory stays flat on huge files.
+# "pandas" — read into a DataFrame first. Only needed when the data has to
+#            be inspected or transformed in Python before it lands.
+LOAD_MODE: str = "stream"
+
+# True  — drop the database and rebuild it from scratch.
+# False — leave the database in place, just apply SCHEMA_DIR and reload CSVs.
+RECREATE_DB: bool = True
+
+# "null_token" is the text that means NULL in the source files. An empty
+# string (the default) means an empty CSV field is NULL.
+CSV_DIALECT: dict[str, str] = {
+    "delimiter":  ",",
+    "encoding":   "utf-8",
+    "null_token": "",
+}
+
+# ============================================================
 # ANSI COLOR HELPERS (no external deps)
-# ============================================
+# ============================================================
 
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-RED    = "\033[91m"
-GREEN  = "\033[92m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[91m"
+GREEN = "\033[92m"
 YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-WHITE  = "\033[97m"
+CYAN = "\033[96m"
+WHITE = "\033[97m"
 
-def _c(text, *codes):
+
+def _c(text: object, *codes: str) -> str:
     """Wrap text with one or more ANSI codes and reset at the end."""
     return "".join(codes) + str(text) + RESET
 
-# ============================================
+
+# ============================================================
 # SPINNER (pure threading, no external deps)
-# ============================================
+# ============================================================
 
 class Spinner:
     """
-    Context-manager spinner that animates on a single terminal line
-    while a blocking operation runs, then replaces itself with a
-    success / failure icon when complete.
+    Context-manager spinner that animates on a single terminal line while a
+    blocking operation runs, then replaces itself with a success / failure
+    icon when complete.
 
     Usage:
         with Spinner("Creating table players"):
             do_slow_work()
-        # success → ✅  Creating table players  (done)
+        # success → ✅  Creating table players
         # error   → ❌  Creating table players  (failed)
     """
 
-    FRAMES   = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     INTERVAL = 0.08   # seconds between frames
 
-    def __init__(self, message: str, indent: int = 2):
-        self.message  = message
-        self.indent   = " " * indent
-        self._stop    = threading.Event()
-        self._thread  = threading.Thread(target=self._spin, daemon=True)
+    def __init__(self, message: str, indent: int = 2) -> None:
+        self.message = message
+        self.indent = " " * indent
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
 
-    def _spin(self):
+    def _spin(self) -> None:
         for frame in itertools.cycle(self.FRAMES):
             if self._stop.is_set():
                 break
@@ -184,49 +121,79 @@ class Spinner:
             sys.stdout.flush()
             time.sleep(self.INTERVAL)
 
-    def start(self):
+    def start(self) -> "Spinner":
         self._thread.start()
         return self
 
-    def stop(self, success: bool = True, suffix: str = ""):
+    def stop(self, success: bool = True, suffix: str = "") -> None:
         self._stop.set()
         self._thread.join()
         icon = _c("✅", GREEN) if success else _c("❌", RED)
-        tag  = _c(f"  ({suffix})", DIM) if suffix else ""
+        tag = _c(f"  ({suffix})", DIM) if suffix else ""
         sys.stdout.write(f"\r{self.indent}{icon}  {self.message}{tag}\n")
         sys.stdout.flush()
 
-    # ── context-manager protocol ──────────────────────────────────────────
-    def __enter__(self):
+    # ── context-manager protocol ─────────────────────────────────────────
+    def __enter__(self) -> "Spinner":
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool:
         # exc_type is None when the block exits cleanly
         self.stop(success=(exc_type is None))
         # Do NOT suppress exceptions — let them propagate to the caller
         return False
 
-# ============================================
-# FUNCTIONS 
-# ============================================
 
-def _print_header(title: str):
+# ============================================================
+# TERMINAL OUTPUT
+# ============================================================
+
+_BOX_WIDTH = 52
+
+
+def _print_header(title: str) -> None:
     """Print a bold section header with a surrounding box."""
-    bar = "═" * 50
+    bar = "═" * _BOX_WIDTH
     print()
     print(_c(f"╔{bar}╗", BOLD, CYAN))
-    print(_c(f"║  {title:<48}║", BOLD, CYAN))
+    print(_c(f"║  {title:<{_BOX_WIDTH - 2}}║", BOLD, CYAN))
     print(_c(f"╚{bar}╝", BOLD, CYAN))
     print()
 
-def _print_section(label: str):
-    """Print a dimmed step sub-header."""
-    print(_c(f"\n  ── {label} {'─' * (44 - len(label))}", DIM))
 
-def _database_exists(db_name: str, config_init: dict) -> bool:
-    """Return True if the target database already exists in the Postgres cluster."""
-    conn   = psycopg2.connect(**config_init)
+def _print_box(title: str, body: list[str], color: str) -> None:
+    """
+    Print a titled, boxed message block in the given ANSI colour.
+
+    Padding is computed with len(), so every character placed inside the box
+    must span the same number of terminal cells as code points. ⚠ ℹ ✔ ✖ are
+    safe; ✅ ❌ are not (one code point, two cells) — they belong on the
+    unpadded spinner lines instead.
+    """
+    inner = _BOX_WIDTH - 2
+    bar = "═" * _BOX_WIDTH
+    print(_c(f"  ╔{bar}╗", BOLD, color))
+    print(_c(f"  ║  {title:<{inner}}║", BOLD, color))
+    if body:
+        print(_c(f"  ╠{bar}╣", BOLD, color))
+        for line in body:
+            print(_c(f"  ║  {line:<{inner}}║", color))
+    print(_c(f"  ╚{bar}╝", BOLD, color))
+
+
+def _print_section(label: str) -> None:
+    """Print a dimmed step sub-header."""
+    print(_c(f"\n  ── {label} {'─' * max(0, 46 - len(label))}", DIM))
+
+
+# ============================================================
+# DATABASE LIFECYCLE
+# ============================================================
+
+def _database_exists(db_name: str, config_init: dict[str, str]) -> bool:
+    """Return True if the target database already exists in the cluster."""
+    conn = psycopg2.connect(**config_init)
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", [db_name])
@@ -235,38 +202,57 @@ def _database_exists(db_name: str, config_init: dict) -> bool:
         cursor.close()
         conn.close()
 
-def confirm_reset(db_name: str, config_init: dict) -> None:
-    """
-    Warn the user that the database is about to be wiped and rebuilt from
-    scratch, then wait for explicit confirmation before proceeding.
 
-    Rollback guarantee: this function is called BEFORE any destructive
-    operation.  Answering 'no' leaves the database completely untouched —
-    there is nothing to roll back.
+def confirm_reset(
+    db_name: str,
+    config_init: dict[str, str],
+    recreate: bool,
+) -> None:
+    """
+    Describe exactly what is about to happen and wait for confirmation.
+
+    Rollback guarantee: this runs BEFORE any destructive operation, so
+    answering 'no' leaves the database completely untouched — there is
+    nothing to roll back.
     """
     exists = _database_exists(db_name, config_init)
 
-    if exists:
-        # ── Destructive-action warning (database already exists) ───────────
-        print(_c("  ╔══════════════════════════════════════════════════╗", BOLD, YELLOW))
-        print(_c("  ║  ⚠️   WARNING — DESTRUCTIVE OPERATION             ║", BOLD, YELLOW))
-        print(_c("  ╠══════════════════════════════════════════════════╣", BOLD, YELLOW))
-        print(_c("  ║  Database : ", YELLOW) + _c(f"{db_name:<37}", BOLD, WHITE) + _c("║", YELLOW))
-        print(_c("  ║                                                  ║", YELLOW))
-        print(_c("  ║  The database above WILL BE PERMANENTLY          ║", YELLOW))
-        print(_c("  ║  DELETED and rebuilt completely from scratch.    ║", YELLOW))
-        print(_c("  ║  ALL existing data will be lost.                 ║", YELLOW))
-        print(_c("  ╚══════════════════════════════════════════════════╝", BOLD, YELLOW))
+    if recreate and exists:
+        _print_box(
+            "⚠  WARNING — DESTRUCTIVE OPERATION",
+            [
+                "",
+                f"Database : {db_name}",
+                "",
+                "This database WILL BE PERMANENTLY DELETED and",
+                "rebuilt from scratch. ALL existing data is lost.",
+            ],
+            YELLOW,
+        )
+    elif exists:
+        _print_box(
+            "ℹ  APPLY TO EXISTING DATABASE",
+            [
+                "",
+                f"Database : {db_name}",
+                "",
+                "The database is kept. Schema files and CSV loads",
+                "will be applied on top of what is already there.",
+            ],
+            CYAN,
+        )
     else:
-        # ── First-time run (no database exists yet) ────────────────────────
-        print(_c("  ╔══════════════════════════════════════════════════╗", BOLD, CYAN))
-        print(_c("  ║  ℹ️   FIRST-TIME SETUP                            ║", BOLD, CYAN))
-        print(_c("  ╠══════════════════════════════════════════════════╣", BOLD, CYAN))
-        print(_c("  ║  Database : ", CYAN) + _c(f"{db_name:<37}", BOLD, WHITE) + _c("║", CYAN))
-        print(_c("  ║                                                  ║", CYAN))
-        print(_c("  ║  No existing database was found.                 ║", CYAN))
-        print(_c("  ║  A fresh database will be created.               ║", CYAN))
-        print(_c("  ╚══════════════════════════════════════════════════╝", BOLD, CYAN))
+        _print_box(
+            "ℹ  FIRST-TIME SETUP",
+            [
+                "",
+                f"Database : {db_name}",
+                "",
+                "No existing database was found.",
+                "A fresh database will be created.",
+            ],
+            CYAN,
+        )
 
     print()
 
@@ -282,191 +268,313 @@ def confirm_reset(db_name: str, config_init: dict) -> None:
         print(_c("  ✔  Confirmed. Starting setup...", BOLD, GREEN))
         print()
     else:
-        # User declined — nothing has been modified yet, so exiting here is a
-        # complete and safe rollback of the entire operation.
+        # Nothing has been modified yet, so exiting here is a complete and
+        # safe rollback of the entire operation.
         print(_c("  ✖  Aborted. No changes were made.", BOLD, RED))
         print()
         sys.exit(0)
 
-def drop_database(db_name: str, config_init: dict):
-    """Drop PostgreSQL database if it exists, forcing disconnection of active sessions."""
+
+def drop_database(db_name: str, config_init: dict[str, str]) -> None:
+    """Drop the database if it exists, disconnecting any active sessions."""
     with Spinner(f"Dropping database '{db_name}'"):
         conn = psycopg2.connect(**config_init)
         conn.autocommit = True
         cursor = conn.cursor()
         try:
-            # Terminate all active connections to the target database before dropping.
-            # Without this, DROP DATABASE will fail if any sessions are still connected.
+            # Terminate active connections first — without this, DROP
+            # DATABASE fails whenever any session is still connected.
             cursor.execute(
-                sql.SQL("""
-                    SELECT pg_terminate_backend(pid)
-                    FROM pg_stat_activity
-                    WHERE datname = %s AND pid <> pg_backend_pid()
-                """),
-                [db_name]
+                """
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = %s AND pid <> pg_backend_pid()
+                """,
+                [db_name],
             )
-            cursor.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(
-                sql.Identifier(db_name)
-            ))
+            cursor.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name))
+            )
         finally:
             cursor.close()
             conn.close()
 
-def create_database(db_name: str, config_init: dict):
-    """Create PostgreSQL database if it doesn't exist."""
+
+def create_database(db_name: str, config_init: dict[str, str]) -> None:
+    """Create the database, leaving it alone if it already exists."""
     with Spinner(f"Creating database '{db_name}'"):
         conn = psycopg2.connect(**config_init)
         conn.autocommit = True
         cursor = conn.cursor()
         try:
-            cursor.execute(sql.SQL("CREATE DATABASE {}").format(
-                sql.Identifier(db_name)
-            ))
+            cursor.execute(
+                sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name))
+            )
         except psycopg2.errors.DuplicateDatabase:
             pass   # already exists — spinner will still show ✅
         finally:
             cursor.close()
             conn.close()
 
-def _parse_drop_block(schema_sql: str) -> str:
-    """Extract all DROP TABLE lines from the schema as a single SQL string."""
-    lines = [
-        line for line in schema_sql.splitlines()
-        if line.strip().upper().startswith("DROP TABLE")
-    ]
-    return "\n".join(lines)
 
-def _parse_create_statements(schema_sql: str) -> list:
-    """
-    Return a list of (table_name, create_sql) tuples parsed from schema_sql.
-    Handles multi-line CREATE TABLE ... ; blocks.
-    """
-    pattern = re.compile(
-        r"(CREATE\s+TABLE\s+(\w+)\s*\(.*?\);)",
-        re.DOTALL | re.IGNORECASE
+# ============================================================
+# SCHEMA
+# ============================================================
+
+def _schema_files(schema_dir: Path) -> list[Path]:
+    """Return the .sql files in schema_dir, sorted by filename."""
+    if not schema_dir.is_dir():
+        raise FileNotFoundError(f"Schema directory not found: {schema_dir}")
+    files = sorted(schema_dir.glob("*.sql"))
+    if not files:
+        raise FileNotFoundError(f"No .sql files found in {schema_dir}")
+    return files
+
+
+def _list_tables(cursor: extensions.cursor) -> list[str]:
+    """Return every user table in the database, schema-qualified."""
+    cursor.execute(
+        """
+        SELECT table_schema || '.' || table_name
+        FROM information_schema.tables
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY 1
+        """
     )
-    return [(m.group(2), m.group(1)) for m in pattern.finditer(schema_sql)]
+    return [row[0] for row in cursor.fetchall()]
 
-def create_schema(schema_sql: str, config: dict):
+
+def apply_schema(schema_dir: Path, config: dict[str, str]) -> None:
     """
-    Execute schema SQL to create tables, showing a spinner and result per table
-    instead of running the entire schema as one silent batch.
+    Execute every .sql file in schema_dir, in filename order, as one batch
+    per file — verbatim, with no parsing.
+
+    Running the files as written is what guarantees that everything in them
+    actually executes. Extracting statements with a regex silently drops
+    whatever the pattern does not match (CREATE INDEX, CREATE VIEW,
+    schema-qualified names), with no error to reveal the omission.
+
+    The result is then read back from the catalog, so what gets printed is
+    what the database really contains rather than what was intended.
     """
-    conn   = psycopg2.connect(**config)
+    files = _schema_files(schema_dir)
+    conn = psycopg2.connect(**config)
     cursor = conn.cursor()
 
     try:
-        # ── 1. Drop existing tables (single batch) ─────────────────────────
-        drop_sql = _parse_drop_block(schema_sql)
-        if drop_sql:
-            with Spinner("Dropping existing tables"):
-                cursor.execute(drop_sql)
+        for path in files:
+            with Spinner(f"Applying  {_c(path.name, BOLD, WHITE)}"):
+                # No parameters are passed, so psycopg2 performs no
+                # interpolation and a literal '%' in the SQL is safe.
+                cursor.execute(path.read_text(encoding="utf-8"))
                 conn.commit()
 
-        # ── 2. Create each table individually so the user gets live feedback ─
-        tables = _parse_create_statements(schema_sql)
         print()
-        for table_name, create_sql in tables:
-            with Spinner(f"Creating table  {_c(table_name, BOLD, WHITE)}"):
-                cursor.execute(create_sql)
-                conn.commit()
+        for name in _list_tables(cursor):
+            print(f"  {_c('✅', GREEN)}  Table ready  {_c(name, BOLD, WHITE)}")
 
-    except Exception as e:
+    except Exception as exc:
         conn.rollback()
-        print(_c(f"\n  ❌ Schema creation failed: {e}", RED))
+        print(_c(f"\n  ❌ Schema step failed: {exc}", RED))
         raise
     finally:
         cursor.close()
         conn.close()
 
-def load_csv_to_table(csv_path: str, table_name: str, config: dict):
-    """Load CSV file into PostgreSQL table using COPY, with a live spinner."""
-    csv_path = Path(csv_path)
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+
+def _quote_literal(value: str) -> str:
+    """Render a Python string as a single-quoted SQL literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _quote_columns(columns: list[str]) -> str:
+    """Render column names as a quoted, comma-separated identifier list."""
+    return ", ".join('"' + col.strip().replace('"', '""') + '"' for col in columns)
+
+
+def _load_stream(
+    csv_path: Path,
+    table_name: str,
+    cursor: extensions.cursor,
+    dialect: dict[str, str],
+) -> int:
+    """
+    Pipe the CSV file straight into Postgres and let Postgres parse it.
+
+    Nothing passes through pandas, so values reach the table exactly as
+    written in the file and memory use stays flat regardless of file size.
+    This also sidesteps the float-upcast problem described in
+    _restore_integer_columns entirely — it simply cannot arise here.
+
+    Column names are taken from the CSV header, so the file's column order
+    does not have to match the table's.
+    """
+    with csv_path.open("r", encoding=dialect["encoding"], newline="") as handle:
+        header = next(csv.reader([handle.readline()], delimiter=dialect["delimiter"]))
+        handle.seek(0)   # rewind so COPY's HEADER option consumes the header
+        # table_name comes from CSV_MAPPING (trusted config) and may be
+        # schema-qualified, so it is inlined rather than quoted as one
+        # identifier — sql.Identifier would turn raw.sales into "raw.sales".
+        cursor.copy_expert(
+            f"COPY {table_name} ({_quote_columns(header)}) FROM STDIN WITH ("
+            f"FORMAT csv, HEADER true, "
+            f"DELIMITER {_quote_literal(dialect['delimiter'])}, "
+            f"NULL {_quote_literal(dialect['null_token'])})",
+            handle,
+        )
+    return cursor.rowcount
+
+
+def _restore_integer_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Undo pandas' float upcast on integer columns that contain nulls.
+
+    pandas' int64 dtype cannot represent a missing value, so read_csv has no
+    choice but to store any integer column containing nulls as float64 —
+    186 silently becomes 186.0, and Postgres then rejects the text "186.0"
+    for an integer column.
+
+    Where every non-null value in a float column is whole, the column was an
+    integer to begin with and is restored to the nullable Int64 dtype.
+    Columns holding genuine decimals fail that test, stay float, and keep
+    full precision — which is why this is preferred over blanket-rounding
+    every float with to_csv(float_format='%.0f').
+    """
+    for column in frame.select_dtypes(include=["float32", "float64"]).columns:
+        non_null = frame[column].dropna()
+        if not non_null.empty and (non_null % 1 == 0).all():
+            frame[column] = frame[column].astype("Int64")
+    return frame
+
+
+def _load_pandas(
+    csv_path: Path,
+    table_name: str,
+    cursor: extensions.cursor,
+    dialect: dict[str, str],
+) -> int:
+    """
+    Read the CSV into a DataFrame, then COPY that in as CSV text.
+
+    Only worth using when the data has to be touched in Python before it
+    lands; otherwise prefer _load_stream. CSV is used as the wire format
+    (rather than tab-separated text) because pandas quotes embedded
+    delimiters, quotes and newlines correctly for it — a tab-separated
+    export would corrupt any value containing a tab or a backslash.
+
+    NULLs travel as an unquoted \\N, which CSV format treats as NULL only
+    when unquoted, so genuine empty strings survive as empty strings.
+    """
+    na_values = [dialect["null_token"]] if dialect["null_token"] else None
+    frame = pd.read_csv(
+        csv_path,
+        delimiter=dialect["delimiter"],
+        encoding=dialect["encoding"],
+        na_values=na_values,
+    )
+    frame = _restore_integer_columns(frame)
+    buffer = io.StringIO(
+        frame.to_csv(index=False, header=False, na_rep="\\N")
+    )
+    cursor.copy_expert(
+        f"COPY {table_name} ({_quote_columns(list(frame.columns))}) "
+        f"FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+        buffer,
+    )
+    return len(frame)
+
+
+def load_csv_to_table(
+    csv_path: Path,
+    table_name: str,
+    config: dict[str, str],
+    load_mode: str,
+    dialect: dict[str, str],
+) -> None:
+    """Load one CSV into one table, with a live spinner and a row count."""
+    loaders = {"stream": _load_stream, "pandas": _load_pandas}
+    if load_mode not in loaders:
+        raise ValueError(
+            f"LOAD_MODE must be one of {sorted(loaders)}, got {load_mode!r}"
+        )
 
     if not csv_path.exists():
-        print(f"  {_c('⚠', YELLOW)}  CSV not found — skipping: {_c(str(csv_path), DIM)}")
+        print(f"  {_c('⚠', YELLOW)}  Not found — skipping: {_c(csv_path, DIM)}")
+        return
+    if csv_path.stat().st_size == 0:
+        print(f"  {_c('⚠', YELLOW)}  Empty — skipping: {_c(csv_path.name, DIM)}")
         return
 
-    df = pd.read_csv(csv_path)
-
-    if df.empty:
-        print(f"  {_c('⚠', YELLOW)}  CSV is empty — skipping: {_c(csv_path.name, DIM)}")
-        return
-
-    conn    = psycopg2.connect(**config)
-    cursor  = conn.cursor()
-    spinner = Spinner(
-        f"Loading  {_c(f'{table_name:<20}', BOLD, WHITE)}"
-        f"  {_c(f'{len(df):>10,} rows', DIM)}"
-    )
-    spinner.start()
+    conn = psycopg2.connect(**config)
+    cursor = conn.cursor()
+    spinner = Spinner(f"Loading  {_c(f'{table_name:<22}', BOLD, WHITE)}").start()
 
     try:
-        # Convert DataFrame to tab-separated string for COPY
-        # float_format='%.0f' prevents integers with NaNs from being exported as '186.0'
-        output = df.to_csv(
-            index=False, header=False, sep='\t',
-            na_rep='\\N', float_format='%.0f'
-        )
-        cursor.copy_from(
-            file=pd.io.common.StringIO(output),
-            table=table_name,
-            sep='\t',
-            null='\\N',
-            columns=df.columns.tolist()
-        )
+        rows = loaders[load_mode](csv_path, table_name, cursor, dialect)
         conn.commit()
-        spinner.stop(success=True, suffix=f"{len(df):,} rows loaded")
-
-    except Exception as e:
+        spinner.stop(success=True, suffix=f"{rows:,} rows")
+    except Exception as exc:
         conn.rollback()
         spinner.stop(success=False, suffix="failed")
-        print(_c(f"     → {e}", RED))
+        print(_c(f"     → {exc}", RED))
         raise
     finally:
         cursor.close()
         conn.close()
 
-def load_all_csvs(csv_mapping: dict, config: dict):
-    """Load multiple CSVs based on mapping."""
-    for csv_path, table_name in csv_mapping.items():
-        load_csv_to_table(csv_path, table_name, config)
 
-def run_setup():
-    """Main setup function: create DB, schema, and load CSVs."""
+def load_all_csvs(
+    csv_mapping: dict[str, str],
+    config: dict[str, str],
+    load_mode: str,
+    dialect: dict[str, str],
+) -> None:
+    """Load every CSV in the mapping, in the order it is declared."""
+    for rel_path, table_name in csv_mapping.items():
+        load_csv_to_table(_ROOT / rel_path, table_name, config, load_mode, dialect)
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def run_setup() -> None:
+    """Create the database, apply the schema files, and load the CSVs."""
     _print_header("DATABASE SETUP")
+    db_name = DB_CONFIG["dbname"]
 
-    # ── Guard: warn the user and require explicit confirmation ─────────────
-    # confirm_reset() is called BEFORE any destructive operation, so
-    # answering 'no' guarantees zero changes to the database.
-    confirm_reset(DB_CONFIG['dbname'], DB_CONFIG_INIT)
+    # Guard: describe the operation and require explicit confirmation. This
+    # runs before anything destructive, so 'no' guarantees zero changes.
+    confirm_reset(db_name, DB_CONFIG_INIT, RECREATE_DB)
 
-    # Step 1: Drop existing database to ensure a completely fresh start
-    _print_section("Step 1 — Drop existing database")
-    drop_database(DB_CONFIG['dbname'], DB_CONFIG_INIT)
+    step = itertools.count(1)
 
-    # Step 2: Create database
-    _print_section("Step 2 — Create database")
-    create_database(DB_CONFIG['dbname'], DB_CONFIG_INIT)
+    if RECREATE_DB:
+        _print_section(f"Step {next(step)} — Drop existing database")
+        drop_database(db_name, DB_CONFIG_INIT)
 
-    # Step 3: Create schema (per-table spinners shown inside create_schema)
-    _print_section("Step 3 — Create schema")
-    create_schema(SCHEMA_SQL, DB_CONFIG)
+    _print_section(f"Step {next(step)} — Create database")
+    create_database(db_name, DB_CONFIG_INIT)
 
-    # Step 4: Load CSVs
-    _print_section("Step 4 — Load data")
-    if CSV_TABLE_MAPPING:
+    _print_section(f"Step {next(step)} — Apply schema")
+    apply_schema(SCHEMA_DIR, DB_CONFIG)
+
+    _print_section(f"Step {next(step)} — Load data ({LOAD_MODE})")
+    if CSV_MAPPING:
         print()
-        load_all_csvs(CSV_TABLE_MAPPING, DB_CONFIG)
+        load_all_csvs(CSV_MAPPING, DB_CONFIG, LOAD_MODE, CSV_DIALECT)
     else:
-        print("  ℹ️  No CSV files to load (CSV_TABLE_MAPPING is empty).")
+        print(f"  {_c('ℹ', CYAN)}  Nothing to load (CSV_MAPPING is empty).")
 
-    # ── Done ───────────────────────────────────────────────────────────────
     print()
-    print(_c("  ╔══════════════════════════════════════════════════╗", BOLD, GREEN))
-    print(_c("  ║  ✅  Setup complete! Database is ready.          ║", BOLD, GREEN))
-    print(_c("  ╚══════════════════════════════════════════════════╝", BOLD, GREEN))
+    _print_box("✔  Setup complete — database is ready.", [], GREEN)
     print()
+
 
 if __name__ == "__main__":
     run_setup()
