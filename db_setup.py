@@ -322,12 +322,27 @@ def create_database(db_name: str, config_init: dict[str, str]) -> None:
 # ============================================================
 
 def _schema_files(schema_dir: Path) -> list[Path]:
-    """Return the .sql files in schema_dir, sorted by filename."""
+    """
+    Return the top-level .sql files in schema_dir, sorted by filename.
+
+    The glob is deliberately non-recursive. Sub-directories hold SQL that
+    runs later in a pipeline (staging, marts, tests) rather than bootstrap
+    DDL, so they are left alone.
+    """
+    if schema_dir.is_file():
+        raise NotADirectoryError(
+            f"SCHEMA_DIR must be a directory of .sql files, but points at a "
+            f"single file:\n    {schema_dir}\n  Use its folder instead:\n"
+            f"    {schema_dir.parent}"
+        )
     if not schema_dir.is_dir():
         raise FileNotFoundError(f"Schema directory not found: {schema_dir}")
     files = sorted(schema_dir.glob("*.sql"))
     if not files:
-        raise FileNotFoundError(f"No .sql files found in {schema_dir}")
+        raise FileNotFoundError(
+            f"No .sql files directly inside {schema_dir} "
+            f"(sub-directories are not searched)"
+        )
     return files
 
 
